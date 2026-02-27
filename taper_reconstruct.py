@@ -6,14 +6,16 @@ Reconstructs a full image of a photonic lantern taper from a screen-captured
 diameter scan video. The scan moves the taper through the camera FOV at a
 known (approximately constant) speed along one axis.
 
-Two alignment modes:
-  - 'correlation': uses phase correlation between consecutive frames to
-    measure the actual pixel shift (robust to speed variations)
+Three alignment modes:
+  - 'auto' (default): uses phase correlation to measure raw shifts, then
+    derives the pixel scale from the known scan speed and the dominant
+    shift peak. Outlier shifts are replaced with the expected value.
+  - 'correlation': uses phase correlation only (no outlier replacement).
   - 'constant': uses the known scan speed, frame rate, and pixel scale
-    to compute a fixed shift per frame (faster, but assumes constant speed)
+    to compute a fixed shift per frame (faster, but assumes constant speed).
 
 Usage:
-    python taper_reconstruct.py video.mp4 --output taper.png
+    python taper_reconstruct.py video.mp4 --speed 1000 --output taper.png
     python taper_reconstruct.py video.mp4 --mode constant --speed 1000 --pixel_scale 1.5
 
 Author: Claude (for Chris @ SAIL)
@@ -94,6 +96,44 @@ def estimate_shift_correlation(prev, curr, axis=1):
         return shift[1]
 
 
+def find_peak_shift(shifts):
+    """
+    Find the dominant shift value using robust statistics.
+
+    Tries scipy KDE first for a smooth peak estimate, falls back to
+    numpy histogram, then median.
+
+    Parameters
+    ----------
+    shifts : array-like
+        Raw per-frame shift values.
+
+    Returns
+    -------
+    peak : float
+        The dominant shift value.
+    """
+    abs_shifts = np.abs(shifts)
+    # Remove near-zero shifts (stationary frames / failed correlations)
+    abs_shifts = abs_shifts[abs_shifts > 0.5]
+    if len(abs_shifts) < 5:
+        return float(np.median(np.abs(shifts)))
+
+    try:
+        from scipy.stats import gaussian_kde
+
+        kde = gaussian_kde(abs_shifts)
+        x = np.linspace(abs_shifts.min(), abs_shifts.max(), 500)
+        peak = x[np.argmax(kde(x))]
+    except ImportError:
+        # Fallback: histogram peak
+        counts, edges = np.histogram(abs_shifts, bins="auto")
+        peak_bin = np.argmax(counts)
+        peak = (edges[peak_bin] + edges[peak_bin + 1]) / 2.0
+
+    return float(peak)
+
+
 def get_video_info(video_path):
     """Return (fps, frame_count, width, height) for a video."""
     cap = cv2.VideoCapture(str(video_path))
@@ -107,13 +147,14 @@ def get_video_info(video_path):
 
 def reconstruct_taper(
     video_path,
-    mode="correlation",
+    mode="auto",
     scan_speed=None,
     pixel_scale=None,
     axis=1,
     roi=None,
     skip=1,
     blend=True,
+    tolerance=0.3,
 ):
     """
     Reconstruct the full taper image from a scan video.
@@ -123,9 +164,9 @@ def reconstruct_taper(
     video_path : str or Path
         Path to the video.
     mode : str
-        'correlation' or 'constant'.
+        'auto', 'correlation', or 'constant'.
     scan_speed : float, optional
-        Scan speed in um/s (required for 'constant' mode).
+        Scan speed in um/s (required for 'auto' and 'constant' modes).
     pixel_scale : float, optional
         um per pixel (required for 'constant' mode).
     axis : int
@@ -136,6 +177,9 @@ def reconstruct_taper(
         Frame skip factor.
     blend : bool
         If True, use linear blending in overlap regions.
+    tolerance : float
+        For 'auto' mode: fractional deviation from expected shift beyond
+        which a frame's shift is replaced (default 0.3 = 30%).
 
     Returns
     -------
@@ -149,17 +193,18 @@ def reconstruct_taper(
     print(f"Video: {vid_w}x{vid_h}, {fps:.1f} fps, {n_frames} frames")
     print(f"Using every {skip}-th frame -> ~{n_used} frames")
 
-    # For constant mode, compute the expected shift per (used) frame
+    # Validate mode requirements
     if mode == "constant":
         if scan_speed is None or pixel_scale is None:
             raise ValueError(
                 "scan_speed and pixel_scale are required for 'constant' mode"
             )
-        # pixels per second = (um/s) / (um/pixel)
         px_per_sec = scan_speed / pixel_scale
-        # pixels per used frame
         constant_shift = px_per_sec / (fps / skip)
         print(f"Constant shift: {constant_shift:.2f} px/frame")
+    elif mode == "auto":
+        if scan_speed is None:
+            raise ValueError("scan_speed is required for 'auto' mode")
 
     # First pass: collect shifts
     print("Pass 1: estimating shifts...")
@@ -169,12 +214,40 @@ def reconstruct_taper(
 
     for i, frame in enumerate(tqdm(frame_gen, total=n_used, desc="Shifts")):
         if prev_frame is not None:
-            if mode == "correlation":
+            if mode == "constant":
+                shifts.append(constant_shift)
+            else:
+                # Both 'correlation' and 'auto' use phase correlation
                 s = estimate_shift_correlation(prev_frame, frame, axis=axis)
                 shifts.append(s)
-            else:
-                shifts.append(constant_shift)
         prev_frame = frame
+
+    # Auto mode: find dominant shift, derive pixel scale, replace outliers
+    if mode == "auto":
+        raw_shifts = np.array(shifts)
+        # Determine scan sign from cumulative sum
+        sign = np.sign(np.sum(raw_shifts)) or 1.0
+        peak_shift = find_peak_shift(raw_shifts) * sign
+        abs_peak = abs(peak_shift)
+
+        # Derive pixel scale: speed [um/s] / (shift [px/frame] * fps/skip [frame/s])
+        derived_pixel_scale = scan_speed / (abs_peak * fps / skip)
+        print(f"\n--- Auto mode diagnostics ---")
+        print(f"Peak shift: {peak_shift:.3f} px/frame")
+        print(f"Derived pixel scale: {derived_pixel_scale:.4f} um/px")
+
+        # Replace outliers
+        n_replaced = 0
+        for j in range(len(shifts)):
+            deviation = abs(shifts[j] - peak_shift) / abs_peak
+            if deviation > tolerance:
+                shifts[j] = peak_shift
+                n_replaced += 1
+
+        frac = n_replaced / len(shifts) * 100
+        print(f"Replaced {n_replaced}/{len(shifts)} shifts ({frac:.1f}%)")
+        print(f"Shift range (after): [{min(shifts):.3f}, {max(shifts):.3f}]")
+        print(f"-----------------------------\n")
 
     # Compute cumulative positions
     cum_shifts = np.cumsum(shifts)
@@ -279,21 +352,27 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["correlation", "constant"],
-        default="correlation",
-        help="Alignment mode (default: correlation)",
+        choices=["auto", "correlation", "constant"],
+        default="auto",
+        help="Alignment mode (default: auto)",
     )
     parser.add_argument(
         "--speed",
         type=float,
         default=None,
-        help="Scan speed in um/s (for 'constant' mode)",
+        help="Scan speed in um/s (required for 'auto' and 'constant' modes)",
     )
     parser.add_argument(
         "--pixel_scale",
         type=float,
         default=None,
         help="Pixel scale in um/pixel (for 'constant' mode)",
+    )
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=0.3,
+        help="Fractional shift deviation threshold for outlier replacement in 'auto' mode (default: 0.3)",
     )
     parser.add_argument(
         "--axis",
@@ -322,6 +401,12 @@ def main():
         help="Disable linear blending (use simple averaging)",
     )
     parser.add_argument(
+        "--compress",
+        type=float,
+        default=None,
+        help="Compress the scan axis by this factor (e.g. 10 = 10:1 shrink along scan axis)",
+    )
+    parser.add_argument(
         "--save-shifts",
         action="store_true",
         help="Save per-frame shifts to a .npy file",
@@ -338,7 +423,18 @@ def main():
         roi=tuple(args.roi) if args.roi else None,
         skip=args.skip,
         blend=not args.no_blend,
+        tolerance=args.tolerance,
     )
+
+    if args.compress is not None and args.compress > 1:
+        h, w = result.shape[:2]
+        if args.axis == 1:
+            new_w = max(1, int(round(w / args.compress)))
+            result = cv2.resize(result, (new_w, h), interpolation=cv2.INTER_AREA)
+        else:
+            new_h = max(1, int(round(h / args.compress)))
+            result = cv2.resize(result, (w, new_h), interpolation=cv2.INTER_AREA)
+        print(f"Compressed {args.compress:.1f}x along scan axis -> {result.shape[1]} x {result.shape[0]} px")
 
     cv2.imwrite(args.output, result)
     print(f"Saved: {args.output}")
