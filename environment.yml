@@ -2,5 +2,8 @@ name: taper_reconstruct
 dependencies:
   - python>=3.10
   - numpy
-  - opencv
   - tqdm
+  - scipy
+  - pyqt6
+  - python-mss
+  - opencv
