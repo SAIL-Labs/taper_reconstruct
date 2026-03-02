@@ -1,0 +1,21 @@
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+
+# Test / sample data
+*.mp4
+*.png
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taper-tools"
+dynamic = ["version"]
+description = "Record and reconstruct photonic lantern taper images from diameter scan videos"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "opencv-python-headless",
+    "tqdm",
+    "PyQt6",
+    "mss",
+    "scipy",
+]
+
+[project.scripts]
+taper-reconstruct = "taper_tools.reconstruct:main"
+
+[project.gui-scripts]
+taper-recorder = "taper_tools.recorder:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "taper_tools._version.__version__"}

@@ -684,24 +684,7 @@ class TaperRecorderApp(QObject):
 
     def _run_reconstruction(self, video_path):
         """Run taper reconstruction in a background thread."""
-        # Import here to keep it loosely coupled
-        try:
-            from taper_reconstruct import reconstruct_taper
-        except ImportError:
-            # Try finding it next to this script
-            script_dir = str(Path(__file__).parent)
-            if script_dir not in sys.path:
-                sys.path.insert(0, script_dir)
-            try:
-                from taper_reconstruct import reconstruct_taper
-            except ImportError:
-                QMessageBox.critical(
-                    None,
-                    "Missing Module",
-                    "Cannot find taper_reconstruct.py.\n"
-                    "Place it in the same directory as this script.",
-                )
-                return
+        from taper_tools.reconstruct import reconstruct_taper
 
         out_path = str(Path(video_path).with_suffix(".reconstructed.png"))
         s = self.settings
