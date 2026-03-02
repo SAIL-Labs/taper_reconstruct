@@ -1,0 +1,99 @@
+name: Build Standalone Executables
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger on version tags like v1.0.0
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      version:
+        description: 'Version number (e.g., 1.0.0)'
+        required: false
+        default: 'dev'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller PyQt6 opencv-python-headless numpy mss tqdm scipy
+
+      - name: Set version for build
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if ($env:REF_NAME -match '^v') {
+            $version = $env:REF_NAME.TrimStart('v')
+          } elseif (Test-Path VERSION) {
+            $version = (Get-Content VERSION -Raw).Trim()
+          } else {
+            $version = $env:INPUT_VERSION
+            if (-not $version) { $version = "dev" }
+          }
+          Set-Content -Path taper_tools/_version.py -Value "__version__ = `"$version`""
+          Write-Host "Building version: $version"
+          echo "VERSION=$version" >> $env:GITHUB_ENV
+
+      - name: Build Windows executable
+        run: |
+          pyinstaller --onefile --windowed `
+            --name="TaperRecorder-v$env:VERSION" `
+            --hidden-import=taper_tools.reconstruct `
+            --hidden-import=scipy.stats `
+            --hidden-import=scipy.stats._kde `
+            taper_tools/recorder.py
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaperRecorder-Windows
+          path: dist/TaperRecorder-*.exe
+
+  create-release:
+    needs: [build-windows]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: TaperRecorder-Windows
+          path: windows-release/
+
+      - name: Create release archive
+        run: |
+          cd windows-release && zip -r ../TaperRecorder-Windows.zip . && cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            TaperRecorder-Windows.zip
+          generate_release_notes: true
+          body: |
+            ## Installation
+            1. Download `TaperRecorder-Windows.zip`
+            2. Extract and run the `.exe` file
+
+            ## Changes
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
