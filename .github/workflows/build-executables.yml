@@ -52,7 +52,10 @@ jobs:
         run: |
           pyinstaller --onefile --windowed `
             --name="TaperRecorder-v$env:VERSION" `
+            --paths=. `
             --hidden-import=taper_tools.reconstruct `
+            --hidden-import=taper_tools.sidecar `
+            --hidden-import=taper_tools.logging_utils `
             --hidden-import=scipy.stats `
             --hidden-import=scipy.stats._kde `
             taper_tools/recorder.py
