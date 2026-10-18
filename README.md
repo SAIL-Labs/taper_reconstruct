@@ -43,12 +43,16 @@ taper-recorder
 1. A system tray icon (blue "T") appears in the taskbar
 2. Right-click → **Select Region...** to draw a capture area
 3. Right-click → **Show Region Overlay** to confirm the region is on the right spot
-4. Right-click → **Start Recording...** — asks for the scan speed, an optional
-   sample label, and the output folder
+4. Right-click → **Start Recording...** — asks for the scan speed, scan axis,
+   an optional sample label and notes, and the output folder
 5. Right-click → **Stop Recording** when the scan is complete
-6. Right-click → **Reconstruct Last Recording...** to generate the composite image
+6. Right-click → **Reconstruct Last Recording...** — shows the scan speed, axis
+   and frame rate it is about to use, and where each came from, then builds
+   the composite image
 
-Settings (scan speed, frame rate, compression, etc.) are available via the tray menu and persist between sessions.
+Settings hold the defaults (scan speed, axis, frame rate, compression, etc.)
+and persist between sessions; the recording dialog starts from them and
+updates them with whatever you last used.
 
 #### Scan speed and file naming
 
@@ -82,9 +86,20 @@ the panel has nowhere to go, only the outline is drawn.
 | `<name>.reconstruct.log` | Written when that video is reconstructed — inputs, alignment diagnostics, and the traceback if it fails |
 | `<name>.reconstructed.png` | The composite image |
 
-Reconstruction reads `<name>.meta.json` for the scan speed and the frame rate
-actually achieved during capture, so a recording that ran slower than the
-requested rate still gets the right pixel scale.
+Reconstruction reads `<name>.meta.json` for the scan speed, scan axis and the
+frame rate actually achieved during capture, so a recording that ran slower
+than the requested rate still gets the right pixel scale.
+
+#### Reconstructing
+
+Choosing **Reconstruct Last Recording...** or **Reconstruct from File...**
+opens a confirmation dialog listing the scan speed, scan axis and frame rate,
+each tagged with its source: the recording's sidecar, the speed in the file
+name, or the video container. A value that had to fall back to a Settings
+default — a video from before this version, or one recorded elsewhere — is
+flagged in red so it gets checked rather than trusted. Edit anything that is
+wrong and press Enter. Automatic reconstruction after a recording skips the
+dialog, since those values were just entered.
 
 #### Logs
 

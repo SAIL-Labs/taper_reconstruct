@@ -836,10 +836,25 @@ class RecordingSetupDialog(QDialog):
         self.label_edit.textChanged.connect(self._update_preview)
         scan_form.addRow("Sample label:", self.label_edit)
 
+        self.axis_combo = QComboBox()
+        self.axis_combo.addItems(["Horizontal (left-right)", "Vertical (top-bottom)"])
+        self.axis_combo.setCurrentIndex(0 if self.settings.get("axis", 1) == 1 else 1)
+        self.axis_combo.setToolTip(
+            "Direction the taper moves across the capture region. Stored with "
+            "the recording and used to align the frames."
+        )
+        scan_form.addRow("Scan axis:", self.axis_combo)
+
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 60)
         self.fps_spin.setValue(int(self.settings.get("fps", 15)))
         scan_form.addRow("Frame rate:", self.fps_spin)
+
+        self.notes_edit = QLineEdit()
+        self.notes_edit.setPlaceholderText(
+            "optional — objective, fibre ID, anything worth keeping with the scan"
+        )
+        scan_form.addRow("Notes:", self.notes_edit)
 
         layout.addWidget(scan_group)
 
@@ -946,9 +961,113 @@ class RecordingSetupDialog(QDialog):
             "output_dir": self.dir_edit.text().strip(),
             "scan_speed": self.speed_spin.value(),
             "scan_label": self.label_edit.text().strip(),
+            "axis": 1 if self.axis_combo.currentIndex() == 0 else 0,
             "fps": self.fps_spin.value(),
+            "notes": self.notes_edit.text().strip(),
             "show_overlay": self.overlay_cb.isChecked(),
             "overlay_preview": self.overlay_preview_cb.isChecked(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Reconstruction confirmation dialog
+# ---------------------------------------------------------------------------
+class ReconstructionDialog(QDialog):
+    """Shows the scan facts a reconstruction will use, and where each came from.
+
+    Prefilled from the recording's sidecar or file name; anything that had
+    to fall back to a Settings default is flagged so a video recorded
+    elsewhere is never reconstructed at a guessed speed without the user
+    seeing it.
+    """
+
+    def __init__(self, video_path, defaults, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Reconstruct Taper Scan")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.video_path = Path(video_path)
+        self.defaults = dict(defaults)
+        self.settings = dict(settings)
+        self._build_ui()
+        self.setMinimumWidth(500)
+
+    @staticmethod
+    def _source_label(text, warn=False):
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet(
+            "color: #c0392b; font-weight: bold;" if warn else "color: gray;"
+        )
+        return label
+
+    def _build_ui(self):
+        d = self.defaults
+        layout = QVBoxLayout(self)
+
+        file_label = QLabel(f"<b>{self.video_path.name}</b>")
+        file_label.setWordWrap(True)
+        file_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(file_label)
+        if d.get("label"):
+            layout.addWidget(self._source_label(f"Sample label: {d['label']}"))
+
+        form = QFormLayout()
+
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setRange(0.1, 100000.0)
+        self.speed_spin.setDecimals(1)
+        self.speed_spin.setSuffix(" µm/s")
+        self.speed_spin.setValue(float(d["scan_speed"]))
+        form.addRow("Scan speed:", self.speed_spin)
+        form.addRow("", self._source_label(d["speed_source"], d["speed_warn"]))
+
+        self.axis_combo = QComboBox()
+        self.axis_combo.addItems(["Horizontal (left-right)", "Vertical (top-bottom)"])
+        self.axis_combo.setCurrentIndex(0 if d["axis"] == 1 else 1)
+        form.addRow("Scan axis:", self.axis_combo)
+        form.addRow("", self._source_label(d["axis_source"], d["axis_warn"]))
+
+        self.fps_spin = QDoubleSpinBox()
+        self.fps_spin.setRange(0.1, 1000.0)
+        self.fps_spin.setDecimals(3)
+        self.fps_spin.setSuffix(" fps")
+        self.fps_spin.setValue(float(d["fps"]))
+        form.addRow("Frame rate:", self.fps_spin)
+        form.addRow("", self._source_label(d["fps_source"], d["fps_warn"]))
+
+        layout.addLayout(form)
+
+        s = self.settings
+        skip = s.get("skip", 1)
+        compress = s.get("compress", 1.0)
+        processing = QLabel(
+            f"Processing: {'every frame' if skip == 1 else f'every {skip}th frame'}"
+            f" · outlier tolerance {s.get('tolerance', 0.3):.2f}"
+            f" · {'no compression' if not compress or compress <= 1 else f'{compress:g}× compression'}"
+            "  (change in Settings)"
+        )
+        processing.setWordWrap(True)
+        processing.setStyleSheet("color: gray;")
+        layout.addWidget(processing)
+
+        btn_row = QHBoxLayout()
+        go_btn = QPushButton("Reconstruct")
+        go_btn.setDefault(True)
+        go_btn.clicked.connect(self.accept)
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(go_btn)
+        layout.addLayout(btn_row)
+
+    def values(self):
+        return {
+            "scan_speed": self.speed_spin.value(),
+            "axis": 1 if self.axis_combo.currentIndex() == 0 else 0,
+            "fps": self.fps_spin.value(),
         }
 
 
@@ -1023,6 +1142,10 @@ class SettingsDialog(QDialog):
         self.axis_combo = QComboBox()
         self.axis_combo.addItems(["Horizontal (left-right)", "Vertical (top-bottom)"])
         self.axis_combo.setCurrentIndex(0 if self.settings["axis"] == 1 else 1)
+        self.axis_combo.setToolTip(
+            "Default scan axis. Each recording asks for its own, which is "
+            "stored with the video."
+        )
         recon_form.addRow("Scan axis:", self.axis_combo)
 
         self.compress_spin = QDoubleSpinBox()
@@ -1383,6 +1506,7 @@ class TaperRecorderApp(QObject):
             return
 
         values = dialog.values()
+        notes = values.pop("notes")  # per-scan, belongs in the sidecar only
         self.settings.update(values)
         save_settings(self.settings)
 
@@ -1395,7 +1519,8 @@ class TaperRecorderApp(QObject):
         metadata = {
             "scan_speed_um_s": scan_speed,
             "label": values["scan_label"],
-            "axis": self.settings.get("axis", 1),
+            "notes": notes,
+            "axis": values["axis"],
             "skip": self.settings.get("skip", 1),
             "tolerance": self.settings.get("tolerance", 0.3),
             "compress": self.settings.get("compress", 1.0),
@@ -1515,7 +1640,9 @@ class TaperRecorderApp(QObject):
             3000,
         )
         if self.settings.get("auto_reconstruct"):
-            self._run_reconstruction(path)
+            # Values were typed into the setup dialog moments ago; no need
+            # to confirm them again.
+            self._run_reconstruction(path, confirm=False)
 
     def _on_recording_error(self, msg):
         log.error("Recording error: %s", msg)
@@ -1555,28 +1682,115 @@ class TaperRecorderApp(QObject):
         if path:
             self._run_reconstruction(path)
 
-    def _run_reconstruction(self, video_path):
-        """Run taper reconstruction in a background thread."""
+    def _reconstruction_defaults(self, video_path):
+        """Scan facts for a reconstruction, each tagged with its provenance."""
+        from taper_tools.reconstruct import get_video_info
+
+        params = sidecar.scan_parameters(video_path)
+        s = self.settings
+        try:
+            container_fps = float(get_video_info(video_path)[0])
+        except Exception as exc:
+            log.warning("Could not read %s: %s", Path(video_path).name, exc)
+            container_fps = 0.0
+        if not np.isfinite(container_fps):
+            container_fps = 0.0
+
+        d = {"label": params.get("label"), "container_fps": container_fps}
+
+        if "scan_speed" in params:
+            d["scan_speed"] = params["scan_speed"]
+            source = params.get("source", "")
+            d["speed_source"] = (
+                "From the file name"
+                if source == "file name"
+                else f"From the recording ({Path(source).name})"
+            )
+            d["speed_warn"] = False
+        else:
+            d["scan_speed"] = float(s["scan_speed"])
+            d["speed_source"] = (
+                "Settings default — this video has no recorded scan speed. "
+                "Check it before continuing."
+            )
+            d["speed_warn"] = True
+
+        if "axis" in params:
+            d["axis"] = params["axis"]
+            d["axis_source"] = "From the recording"
+            d["axis_warn"] = False
+        else:
+            d["axis"] = int(s["axis"])
+            d["axis_source"] = "Settings default — not recorded with this video"
+            d["axis_warn"] = True
+
+        if "fps" in params:
+            d["fps"] = params["fps"]
+            d["fps_source"] = (
+                f"Measured during recording (container says {container_fps:.2f})"
+                if container_fps > 0
+                else "Measured during recording"
+            )
+            d["fps_warn"] = False
+        elif container_fps > 0:
+            d["fps"] = container_fps
+            d["fps_source"] = "From the video container"
+            d["fps_warn"] = False
+        else:
+            d["fps"] = float(s["fps"])
+            d["fps_source"] = (
+                "The container reports no frame rate — enter the rate the "
+                "scan was captured at"
+            )
+            d["fps_warn"] = True
+        return d
+
+    def _run_reconstruction(self, video_path, confirm=True):
+        """Run taper reconstruction in a background thread.
+
+        With ``confirm`` the scan facts are shown for checking first;
+        automatic reconstruction straight after a recording skips that.
+        """
         from taper_tools.reconstruct import compress_along_axis, reconstruct_taper
 
         out_path = str(Path(video_path).with_suffix(".reconstructed.png"))
         recon_log_path = Path(video_path).with_suffix(".reconstruct.log")
-        self.last_log_path = recon_log_path
         s = dict(self.settings)
 
-        # Prefer the values recorded with the video over the current settings.
-        params = sidecar.scan_parameters(video_path)
-        scan_speed = params.get("scan_speed", s["scan_speed"])
-        axis = params.get("axis", s["axis"])
-        fps_override = params.get("fps")
+        defaults = self._reconstruction_defaults(video_path)
+        sources = {
+            "scan_speed": defaults["speed_source"],
+            "axis": defaults["axis_source"],
+            "fps": defaults["fps_source"],
+        }
+        if confirm:
+            dialog = ReconstructionDialog(video_path, defaults, s)
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                log.info("Reconstruction of %s cancelled", Path(video_path).name)
+                return
+            chosen = dialog.values()
+            for key in sources:
+                if abs(float(chosen[key]) - float(defaults[key])) > 1e-9:
+                    sources[key] = f"Entered by user (was {defaults[key]})"
+        else:
+            chosen = {k: defaults[k] for k in ("scan_speed", "axis", "fps")}
+            if defaults["speed_warn"]:
+                log.warning(
+                    "No recorded scan speed for %s; using the settings value "
+                    "of %.1f µm/s",
+                    Path(video_path).name,
+                    chosen["scan_speed"],
+                )
 
-        if "scan_speed" not in params:
-            log.warning(
-                "No metadata sidecar or scan speed in the file name for %s; "
-                "falling back to the settings value of %.1f µm/s",
-                Path(video_path).name,
-                scan_speed,
-            )
+        self.last_log_path = recon_log_path
+        scan_speed = float(chosen["scan_speed"])
+        axis = int(chosen["axis"])
+        # Only override the container rate when it actually differs
+        fps_override = (
+            float(chosen["fps"])
+            if abs(float(chosen["fps"]) - defaults["container_fps"]) > 1e-3
+            else None
+        )
 
         self.tray.showMessage(
             "Reconstructing...",
@@ -1597,9 +1811,11 @@ class TaperRecorderApp(QObject):
                         "video": video_path,
                         "output": out_path,
                         "scan speed": scan_speed,
-                        "speed source": params.get("source", "settings"),
+                        "speed source": sources["scan_speed"],
                         "axis": axis,
+                        "axis source": sources["axis"],
                         "fps override": fps_override,
+                        "fps source": sources["fps"],
                         "skip": s["skip"],
                         "tolerance": s["tolerance"],
                         "compress": s.get("compress"),
