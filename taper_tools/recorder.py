@@ -84,6 +84,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QTextEdit,
+    QListWidget,
+    QListWidgetItem,
 )
 
 from taper_tools import sidecar
@@ -118,6 +120,11 @@ DEFAULT_SETTINGS = {
     "region": None,  # scan capture region [x, y, w, h]
     "process_region": None,  # in-progress capture region [x, y, w, h]
     "process_fps": 5,
+    # Record into <output_dir>/unfiled and pick the device folder afterwards.
+    # A taper's folder usually does not exist until the draw is finished,
+    # so this is the default for process recordings.
+    "scan_defer_folder": False,
+    "process_defer_folder": True,
 }
 
 SETTINGS_PATH = Path.home() / ".taper_recorder.json"
@@ -262,12 +269,14 @@ MODES = {
         "title": "Scan",
         "region_key": "region",
         "fps_key": "fps",
+        "defer_key": "scan_defer_folder",
         "idle_colour": PREVIEW_COLOUR,
     },
     sidecar.KIND_PROCESS: {
         "title": "Process",
         "region_key": "process_region",
         "fps_key": "process_fps",
+        "defer_key": "process_defer_folder",
         "idle_colour": PROCESS_COLOUR,
     },
 }
@@ -916,12 +925,26 @@ class RecordingSetupDialog(QDialog):
         out_form = QFormLayout(out_group)
 
         self.dir_edit = QLineEdit(self.settings.get("output_dir", ""))
+        self.dir_edit.textChanged.connect(self._update_preview)
         dir_row = QHBoxLayout()
         dir_row.addWidget(self.dir_edit)
-        browse_btn = QPushButton("Browse...")
-        browse_btn.clicked.connect(self._browse_dir)
-        dir_row.addWidget(browse_btn)
+        self.browse_btn = QPushButton("Browse...")
+        self.browse_btn.clicked.connect(self._browse_dir)
+        dir_row.addWidget(self.browse_btn)
         out_form.addRow("Folder:", dir_row)
+
+        defer_key = self.mode_info["defer_key"]
+        self.defer_cb = QCheckBox("Choose the folder when the recording finishes")
+        self.defer_cb.setChecked(
+            bool(self.settings.get(defer_key, DEFAULT_SETTINGS[defer_key]))
+        )
+        self.defer_cb.setToolTip(
+            "Record into the holding folder for now and pick (or create) the "
+            "device folder once the recording stops. Handy when the device "
+            "does not have a folder yet."
+        )
+        self.defer_cb.toggled.connect(self._update_preview)
+        out_form.addRow(self.defer_cb)
 
         self.name_label = QLabel()
         self.name_label.setWordWrap(True)
@@ -982,7 +1005,22 @@ class RecordingSetupDialog(QDialog):
             self.dir_edit.setText(directory)
 
     def _update_preview(self):
-        self.name_label.setText(self.filename())
+        if self.defer_cb.isChecked():
+            holding = sidecar.holding_dir(self.dir_edit.text().strip() or ".")
+            self.name_label.setText(
+                f"{self.filename()}\n(held in {holding} until filed)"
+            )
+        else:
+            self.name_label.setText(self.filename())
+
+    @property
+    def defer_folder(self):
+        return self.defer_cb.isChecked()
+
+    def record_dir(self):
+        """Where the video is written: the holding folder when deferred."""
+        base = Path(self.dir_edit.text().strip())
+        return sidecar.holding_dir(base) if self.defer_folder else base
 
     def filename(self):
         """File name for the recording.
@@ -1006,6 +1044,8 @@ class RecordingSetupDialog(QDialog):
             return
         try:
             Path(directory).mkdir(parents=True, exist_ok=True)
+            if self.defer_folder:
+                sidecar.holding_dir(directory).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             QMessageBox.critical(
                 self, "Output folder", f"Cannot use {directory}:\n{exc}"
@@ -1022,11 +1062,183 @@ class RecordingSetupDialog(QDialog):
             "notes": self.notes_edit.text().strip(),
             "show_overlay": self.overlay_cb.isChecked(),
             "overlay_preview": self.overlay_preview_cb.isChecked(),
+            self.mode_info["defer_key"]: self.defer_folder,
         }
         if self.is_scan:
             values["scan_speed"] = self.speed_spin.value()
             values["axis"] = 1 if self.axis_combo.currentIndex() == 0 else 0
         return values
+
+
+# ---------------------------------------------------------------------------
+# Filing recordings into a device folder
+# ---------------------------------------------------------------------------
+class FileRecordingPrompt(QDialog):
+    """Asked when a deferred recording stops: where does it go?"""
+
+    CHOOSE = 1
+    LATER = 0
+
+    def __init__(self, video_path, mode, parent=None):
+        super().__init__(parent)
+        title = MODES[mode]["title"]
+        self.setWindowTitle(f"{title} Recording Finished")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        layout = QVBoxLayout(self)
+        heading = QLabel(
+            "<b>Taper finished — where does this recording go?</b>"
+            if mode == sidecar.KIND_PROCESS
+            else "<b>Where does this recording go?</b>"
+        )
+        layout.addWidget(heading)
+        name = QLabel(Path(video_path).name)
+        name.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(name)
+        hint = QLabel(
+            "Pick the device folder (you can create it in the picker). The "
+            "video, its metadata and log move together. \"Later\" leaves it in "
+            "the holding folder; file it any time from Logs → File Held "
+            "Recordings."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray;")
+        layout.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        later_btn = QPushButton("Later")
+        later_btn.clicked.connect(lambda: self.done(self.LATER))
+        choose_btn = QPushButton("Choose Folder...")
+        choose_btn.setDefault(True)
+        choose_btn.clicked.connect(lambda: self.done(self.CHOOSE))
+        btn_row.addStretch()
+        btn_row.addWidget(later_btn)
+        btn_row.addWidget(choose_btn)
+        layout.addLayout(btn_row)
+        self.setMinimumWidth(460)
+
+
+class HeldRecordingsDialog(QDialog):
+    """Lists what is waiting in the holding folder and files it."""
+
+    def __init__(self, output_dir, busy_paths=(), parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("File Held Recordings")
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        self.output_dir = Path(output_dir)
+        self.busy_paths = {str(Path(p).resolve()) for p in busy_paths}
+        self.moved = []  # (old_path, new_path)
+        self._build_ui()
+        self.resize(640, 420)
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        self.folder_label = QLabel(str(sidecar.holding_dir(self.output_dir)))
+        self.folder_label.setStyleSheet("color: gray;")
+        self.folder_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        layout.addWidget(self.folder_label)
+
+        self.list = QListWidget()
+        layout.addWidget(self.list)
+
+        hint = QLabel(
+            "Tick the recordings that belong to one device — usually the draw "
+            "and the scan that followed it — then choose its folder."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray;")
+        layout.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        self.move_btn = QPushButton("Move Selected to Folder...")
+        self.move_btn.setDefault(True)
+        self.move_btn.clicked.connect(self._move_selected)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(self.move_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        self._populate()  # needs move_btn to exist
+
+    @staticmethod
+    def _describe(video_path):
+        meta = sidecar.read_metadata(video_path) or {}
+        kind = meta.get("kind") or (
+            sidecar.KIND_SCAN if video_path.name.startswith(sidecar.FILENAME_PREFIX)
+            else "video"
+        )
+        bits = [kind.capitalize()]
+        if meta.get("label"):
+            bits.append(meta["label"])
+        if meta.get("scan_speed_um_s"):
+            bits.append(f"{float(meta['scan_speed_um_s']):g} µm/s")
+        if meta.get("duration_s"):
+            mins, secs = divmod(int(meta["duration_s"]), 60)
+            bits.append(f"{mins:02d}:{secs:02d}")
+        when = datetime.fromtimestamp(video_path.stat().st_mtime)
+        bits.append(when.strftime("%Y-%m-%d %H:%M"))
+        return " · ".join(bits)
+
+    def _populate(self):
+        self.list.clear()
+        videos = sidecar.held_recordings(self.output_dir)
+        for video in videos:
+            item = QListWidgetItem(f"{video.name}\n    {self._describe(video)}")
+            item.setData(Qt.ItemDataRole.UserRole, str(video))
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            if str(video.resolve()) in self.busy_paths:
+                item.setText(item.text() + "   (reconstructing — wait)")
+                item.setFlags(Qt.ItemFlag.NoItemFlags)
+                item.setCheckState(Qt.CheckState.Unchecked)
+            else:
+                item.setCheckState(Qt.CheckState.Checked)
+            self.list.addItem(item)
+        if not videos:
+            placeholder = QListWidgetItem("Nothing is waiting to be filed.")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.list.addItem(placeholder)
+        self.move_btn.setEnabled(bool(videos))
+
+    def selected_paths(self):
+        paths = []
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            if item.checkState() == Qt.CheckState.Checked:
+                paths.append(Path(item.data(Qt.ItemDataRole.UserRole)))
+        return paths
+
+    def _move_selected(self):
+        paths = self.selected_paths()
+        if not paths:
+            QMessageBox.information(self, "Nothing selected", "Tick at least one recording.")
+            return
+        dest = QFileDialog.getExistingDirectory(
+            self, "Move to device folder", str(self.output_dir)
+        )
+        if not dest:
+            return
+        self.file_recordings(paths, dest)
+        self._populate()
+
+    def file_recordings(self, paths, dest):
+        """Move each recording; report whatever could not be moved."""
+        failures = []
+        for video in paths:
+            try:
+                new_path = sidecar.move_recording(video, dest)
+                self.moved.append((video, new_path))
+            except Exception as exc:
+                log.error("Could not file %s: %s", video.name, exc)
+                failures.append(f"{video.name}: {exc}")
+        if failures:
+            QMessageBox.warning(
+                self, "Some recordings were not moved", "\n".join(failures)
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1276,12 +1488,18 @@ class SettingsDialog(QDialog):
 class TaperRecorderApp(QObject):
     _recon_message = pyqtSignal(str, str, QSystemTrayIcon.MessageIcon, int)
     _recon_failed = pyqtSignal(str, str, str)
+    _recon_done = pyqtSignal(str)
 
     def __init__(self):
         super().__init__()
         self._recon_message.connect(self._show_tray_message)
         self._recon_failed.connect(self._show_reconstruction_failure)
+        self._recon_done.connect(self._on_reconstruction_done)
         self.settings = load_settings()
+        # Videos a reconstruction thread currently has open; filing waits.
+        self._busy_videos = set()
+        self._current_deferred = False
+        self._pending_filing = None
         self.recorder = None
         self.recording = False
         self.recording_mode = None
@@ -1305,6 +1523,19 @@ class TaperRecorderApp(QObject):
         self._preview_timer.timeout.connect(self._update_idle_overlay)
 
         log.info("Recorder ready (settings: %s)", SETTINGS_PATH)
+        self._announce_held_recordings()
+
+    def _announce_held_recordings(self):
+        held = sidecar.held_recordings(self.settings["output_dir"])
+        if held:
+            log.info("%d recording(s) waiting in %s", len(held), held[0].parent)
+            self.tray.showMessage(
+                "Recordings Waiting to Be Filed",
+                f"{len(held)} recording(s) in {held[0].parent.name}/ — "
+                "Logs → File Held Recordings...",
+                QSystemTrayIcon.MessageIcon.Information,
+                5000,
+            )
 
     def _create_icon(self, recording=False):
         """Generate a simple coloured icon (no external file needed)."""
@@ -1393,6 +1624,10 @@ class TaperRecorderApp(QObject):
         open_dir_action = QAction("Open Output Folder", self)
         open_dir_action.triggered.connect(self._open_output_dir)
         menu.addAction(open_dir_action)
+
+        file_held_action = QAction("File Held Recordings...", self)
+        file_held_action.triggered.connect(self.file_held_recordings)
+        menu.addAction(file_held_action)
 
         logs_menu = menu.addMenu("Logs")
         view_log_action = QAction("View Last Log...", self)
@@ -1633,8 +1868,9 @@ class TaperRecorderApp(QObject):
         self.settings.update(values)
         save_settings(self.settings)
 
-        out_dir = Path(values["output_dir"])
-        video_path = str(out_dir / dialog.filename())
+        record_dir = dialog.record_dir()
+        self._current_deferred = dialog.defer_folder
+        video_path = str(record_dir / dialog.filename())
         fps = values[info["fps_key"]]
         scan_speed = values.get("scan_speed")
 
@@ -1643,6 +1879,7 @@ class TaperRecorderApp(QObject):
             "kind": mode,
             "label": values["scan_label"],
             "notes": notes,
+            "held_for_filing": dialog.defer_folder,
             "region_logical": list(region),
             "device_pixel_ratio": self._device_pixel_ratio(region),
         }
@@ -1787,14 +2024,101 @@ class TaperRecorderApp(QObject):
             QSystemTrayIcon.MessageIcon.Information,
             3000,
         )
-        if mode != sidecar.KIND_SCAN:
-            return  # a process video is the finished product
-        self.last_scan_video_path = path
-        self.recon_action.setEnabled(True)
-        if self.settings.get("auto_reconstruct"):
-            # Values were typed into the setup dialog moments ago; no need
-            # to confirm them again.
-            self._run_reconstruction(path, confirm=False)
+        if mode == sidecar.KIND_SCAN:
+            self.last_scan_video_path = path
+            self.recon_action.setEnabled(True)
+            if self.settings.get("auto_reconstruct"):
+                # Values were typed into the setup dialog moments ago; no
+                # need to confirm them again.
+                self._run_reconstruction(path, confirm=False)
+
+        if self._current_deferred:
+            self._current_deferred = False
+            if self._is_busy(path):
+                # Reconstruction has the file open; ask once it is done.
+                self._pending_filing = (mode, path)
+            else:
+                self._offer_filing(mode, path)
+
+    # --- Filing ---
+    @staticmethod
+    def _key(path):
+        return str(Path(path).resolve())
+
+    def _is_busy(self, path):
+        return self._key(path) in self._busy_videos
+
+    def _offer_filing(self, mode, path):
+        """Ask where a deferred recording belongs, now that it is finished."""
+        prompt = FileRecordingPrompt(path, mode)
+        if prompt.exec() != FileRecordingPrompt.CHOOSE:
+            log.info("%s left in the holding folder", Path(path).name)
+            return
+        dest = QFileDialog.getExistingDirectory(
+            None, "Move recording to device folder", self.settings["output_dir"]
+        )
+        if not dest:
+            log.info("%s left in the holding folder", Path(path).name)
+            return
+        self._file_recording(path, dest)
+
+    def _file_recording(self, path, dest):
+        try:
+            new_path = sidecar.move_recording(path, dest)
+        except Exception as exc:
+            log.error("Could not file %s: %s", Path(path).name, exc)
+            QMessageBox.critical(
+                None,
+                "Could Not File Recording",
+                f"{Path(path).name}\n\n{exc}\n\nIt is still in the holding folder.",
+            )
+            return None
+        self._note_moved(path, new_path)
+        self.tray.showMessage(
+            "Recording Filed",
+            f"{Path(new_path).name}\n→ {Path(dest)}",
+            QSystemTrayIcon.MessageIcon.Information,
+            3000,
+        )
+        return new_path
+
+    def _note_moved(self, old_path, new_path):
+        """Keep the 'last recording' references pointing at the moved files."""
+        old_key = self._key(old_path)
+        if self.current_video_path and self._key(self.current_video_path) == old_key:
+            self.current_video_path = str(new_path)
+        if (
+            self.last_scan_video_path
+            and self._key(self.last_scan_video_path) == old_key
+        ):
+            self.last_scan_video_path = str(new_path)
+        if self.last_log_path and Path(self.last_log_path).parent == Path(old_path).parent:
+            candidate = Path(new_path).parent / Path(self.last_log_path).name
+            if candidate.exists():
+                self.last_log_path = candidate
+
+    def file_held_recordings(self):
+        dialog = HeldRecordingsDialog(
+            self.settings["output_dir"], busy_paths=self._busy_videos
+        )
+        dialog.exec()
+        for old_path, new_path in dialog.moved:
+            self._note_moved(old_path, new_path)
+        if dialog.moved:
+            self.tray.showMessage(
+                "Recordings Filed",
+                f"{len(dialog.moved)} recording(s) moved to "
+                f"{Path(dialog.moved[0][1]).parent}",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
+
+    def _on_reconstruction_done(self, video_path):
+        self._busy_videos.discard(self._key(video_path))
+        if self._pending_filing and self._key(self._pending_filing[1]) == self._key(video_path):
+            mode, path = self._pending_filing
+            self._pending_filing = None
+            self._offer_filing(mode, path)
 
     def _on_recording_error(self, msg):
         log.error("Recording error: %s", msg)
@@ -1941,6 +2265,7 @@ class TaperRecorderApp(QObject):
                 )
 
         self.last_log_path = recon_log_path
+        self._busy_videos.add(self._key(video_path))
         scan_speed = float(chosen["scan_speed"])
         axis = int(chosen["axis"])
         # Only override the container rate when it actually differs
@@ -2017,6 +2342,8 @@ class TaperRecorderApp(QObject):
                     self._recon_failed.emit(
                         str(exc), detail, str(recon_log_path)
                     )
+                finally:
+                    self._recon_done.emit(str(video_path))
 
         thread = threading.Thread(target=_worker, daemon=True)
         thread.start()

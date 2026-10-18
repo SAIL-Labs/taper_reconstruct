@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from datetime import datetime
 from pathlib import Path
 
@@ -33,6 +34,10 @@ SCHEMA_VERSION = 1
 FILENAME_PREFIX = "taper_scan"
 PROCESS_PREFIX = "taper_process"
 _SPEED_RE = re.compile(r"_(\d+(?:p\d+)?)umps(?:_|\.|$)", re.IGNORECASE)
+
+# Recordings whose device folder does not exist yet (a taper still being
+# drawn) wait here, under the output folder, until they are filed.
+HOLDING_DIRNAME = "unfiled"
 
 # What a recording is of: a diameter scan to be stitched into one image,
 # or the taper being drawn, kept as an ordinary video.
@@ -180,3 +185,68 @@ def scan_parameters(video_path):
                 sidecar_path(video_path).name,
             )
     return params
+
+
+# ---------------------------------------------------------------------------
+# Filing recordings into a device folder
+# ---------------------------------------------------------------------------
+VIDEO_SUFFIXES = (".mp4", ".avi", ".mkv", ".mov")
+
+
+def holding_dir(output_dir):
+    """The holding folder for recordings not yet filed."""
+    return Path(output_dir) / HOLDING_DIRNAME
+
+
+def companion_files(video_path):
+    """Every file that belongs with a video: the sidecar, logs, reconstruction.
+
+    They all share the video's stem (``scan.mp4`` -> ``scan.meta.json``,
+    ``scan.log``, ``scan.reconstruct.log``, ``scan.reconstructed.png``), so
+    moving a recording means moving this whole set.
+    """
+    video_path = Path(video_path)
+    if not video_path.parent.exists():
+        return []
+    return sorted(
+        f for f in video_path.parent.glob(video_path.stem + ".*") if f.is_file()
+    )
+
+
+def held_recordings(output_dir):
+    """Videos waiting in the holding folder, newest first."""
+    folder = holding_dir(output_dir)
+    if not folder.is_dir():
+        return []
+    videos = [
+        f for f in folder.iterdir()
+        if f.is_file() and f.suffix.lower() in VIDEO_SUFFIXES
+    ]
+    return sorted(videos, key=lambda f: f.stat().st_mtime, reverse=True)
+
+
+def move_recording(video_path, dest_dir):
+    """Move a video and its companions into ``dest_dir``.
+
+    Refuses rather than overwrites if any destination already exists.
+
+    Returns
+    -------
+    new_video_path : Path
+    """
+    video_path = Path(video_path)
+    dest_dir = Path(dest_dir)
+    files = companion_files(video_path)
+    if video_path not in files:
+        raise FileNotFoundError(f"Recording not found: {video_path}")
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    clashes = [f.name for f in files if (dest_dir / f.name).exists()]
+    if clashes:
+        raise FileExistsError(
+            f"Already in {dest_dir}: {', '.join(clashes)}"
+        )
+    for f in files:
+        shutil.move(str(f), str(dest_dir / f.name))
+        log.info("Filed %s -> %s", f.name, dest_dir)
+    return dest_dir / video_path.name

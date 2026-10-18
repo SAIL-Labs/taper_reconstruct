@@ -71,6 +71,25 @@ capture log; a process sidecar carries `"kind": "process"`, and if such a
 video is ever sent to **Reconstruct from File...** the confirmation dialog
 says so in red.
 
+#### Filing a recording whose folder doesn't exist yet
+
+A device usually gets its data folder only once the taper is finished, which
+is after its process recording has to start. So the setup dialog has a
+checkbox, **Choose the folder when the recording finishes** — on by default
+for process recordings, off for scans, remembered per mode. A deferred
+recording is written to `<output folder>/unfiled/`, and when it stops a
+prompt asks where it goes: **Choose Folder...** opens a picker (create the
+device folder right there) and moves the video with its sidecar and logs;
+**Later** leaves it in `unfiled/`.
+
+Anything left behind is filed from **File Held Recordings...** in the tray
+menu: tick the recordings that belong together — typically the draw and the
+scan that followed it — and pick one destination. The video and every file
+sharing its name (`.meta.json`, `.log`, `.reconstruct.log`,
+`.reconstructed.png`) always move as a set, nothing is ever overwritten, and
+a video that is still being reconstructed is held back until that finishes.
+The tray mentions how many recordings are waiting when the app starts.
+
 Settings hold the defaults (scan speed, axis, frame rate, compression, etc.)
 and persist between sessions; the recording dialog starts from them and
 updates them with whatever you last used.
@@ -107,6 +126,8 @@ the panel has nowhere to go, only the outline is drawn.
 | `<name>.log` | Capture log: environment, frame size, progress, capture statistics |
 | `<name>.reconstruct.log` | Written when that video is reconstructed — inputs, alignment diagnostics, and the traceback if it fails |
 | `<name>.reconstructed.png` | The composite image |
+
+These always travel together: filing a held recording moves the whole set.
 
 Reconstruction reads `<name>.meta.json` for the scan speed, scan axis and the
 frame rate actually achieved during capture, so a recording that ran slower
