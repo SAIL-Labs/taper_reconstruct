@@ -31,7 +31,13 @@ LOG_SUFFIX = ".log"
 SCHEMA_VERSION = 1
 
 FILENAME_PREFIX = "taper_scan"
+PROCESS_PREFIX = "taper_process"
 _SPEED_RE = re.compile(r"_(\d+(?:p\d+)?)umps(?:_|\.|$)", re.IGNORECASE)
+
+# What a recording is of: a diameter scan to be stitched into one image,
+# or the taper being drawn, kept as an ordinary video.
+KIND_SCAN = "scan"
+KIND_PROCESS = "process"
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +68,19 @@ def build_video_filename(scan_speed, label=None, timestamp=None, extension=".mp4
         timestamp = timestamp.strftime("%Y%m%d_%H%M%S")
 
     parts = [FILENAME_PREFIX, timestamp, f"{format_speed(scan_speed)}umps"]
+    slug = slugify(label)
+    if slug:
+        parts.append(slug)
+    return "_".join(parts) + extension
+
+
+def build_process_filename(label=None, timestamp=None, extension=".mp4"):
+    """Build ``taper_process_<timestamp>[_<label>].mp4`` for an in-progress recording."""
+    if timestamp is None:
+        timestamp = datetime.now()
+    if isinstance(timestamp, datetime):
+        timestamp = timestamp.strftime("%Y%m%d_%H%M%S")
+    parts = [PROCESS_PREFIX, timestamp]
     slug = slugify(label)
     if slug:
         parts.append(slug)
@@ -128,7 +147,8 @@ def scan_parameters(video_path):
     -------
     params : dict
         Keys present only when known: ``scan_speed``, ``fps``, ``axis``,
-        ``label``, plus ``source`` saying where the scan speed came from.
+        ``label``, ``kind``, plus ``source`` saying where the scan speed
+        came from.
     """
     params = {}
     meta = read_metadata(video_path)
@@ -144,6 +164,8 @@ def scan_parameters(video_path):
             params["axis"] = int(meta["axis"])
         if meta.get("label"):
             params["label"] = meta["label"]
+        if meta.get("kind"):
+            params["kind"] = meta["kind"]
 
     # A sidecar without a speed (hand-edited, older schema) must not hide
     # the speed written into the file name.

@@ -115,7 +115,9 @@ DEFAULT_SETTINGS = {
     "auto_reconstruct": False,
     "show_overlay": True,
     "overlay_preview": True,
-    "region": None,  # [x, y, w, h]
+    "region": None,  # scan capture region [x, y, w, h]
+    "process_region": None,  # in-progress capture region [x, y, w, h]
+    "process_fps": 5,
 }
 
 SETTINGS_PATH = Path.home() / ".taper_recorder.json"
@@ -250,6 +252,25 @@ PANEL_GAP = 8  # gap between the outline and the status panel
 
 RECORDING_COLOUR = QColor(235, 60, 60)
 PREVIEW_COLOUR = QColor(0, 180, 255)
+PROCESS_COLOUR = QColor(255, 170, 0)
+
+# The two things the recorder captures.  A scan is stitched into one image
+# afterwards and needs the stage speed; a process recording is the taper
+# being drawn, kept as a plain video.  Each has its own screen region.
+MODES = {
+    sidecar.KIND_SCAN: {
+        "title": "Scan",
+        "region_key": "region",
+        "fps_key": "fps",
+        "idle_colour": PREVIEW_COLOUR,
+    },
+    sidecar.KIND_PROCESS: {
+        "title": "Process",
+        "region_key": "process_region",
+        "fps_key": "process_fps",
+        "idle_colour": PROCESS_COLOUR,
+    },
+}
 
 THUMB_MAX_W = 260
 THUMB_MAX_H = 200
@@ -435,13 +456,14 @@ class StatusPanel(ClickThroughWindow):
 class CaptureOverlay(QObject):
     """Outline + status panel shown over the captured region."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, idle_colour=PREVIEW_COLOUR):
         super().__init__(parent)
         self._outline = RegionOutline()
         self._panel = StatusPanel()
         self._region = None
         self._show_panel = True
         self._panel_fits = True
+        self._idle_colour = idle_colour
 
     @staticmethod
     def _to_pixmap(frame):
@@ -466,7 +488,7 @@ class CaptureOverlay(QObject):
     def show(self, region, recording=False, show_panel=True):
         self._region = QRect(region)
         self._show_panel = show_panel
-        colour = RECORDING_COLOUR if recording else PREVIEW_COLOUR
+        colour = RECORDING_COLOUR if recording else self._idle_colour
 
         self._outline.set_colour(colour)
         self._outline.set_region(self._region)
@@ -503,7 +525,7 @@ class CaptureOverlay(QObject):
             self._panel.hide()
 
     def set_recording(self, recording):
-        colour = RECORDING_COLOUR if recording else PREVIEW_COLOUR
+        colour = RECORDING_COLOUR if recording else self._idle_colour
         self._outline.set_colour(colour)
         self._panel.set_colour(colour)
         self._panel.update()
@@ -799,60 +821,92 @@ class ScreenRecorder:
 # Recording setup dialog
 # ---------------------------------------------------------------------------
 class RecordingSetupDialog(QDialog):
-    """Asks for the scan speed (and where to save) before recording."""
+    """Asks what is about to be recorded, and where to save it.
 
-    def __init__(self, settings, region, parent=None):
+    For a scan: the stage speed and axis (needed to stitch the frames).
+    For a process recording: just a label, notes and frame rate.
+    """
+
+    def __init__(self, settings, region, mode=sidecar.KIND_SCAN, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Start Taper Scan Recording")
+        self.mode = mode
+        self.mode_info = MODES[mode]
+        self.setWindowTitle(f"Start Taper {self.mode_info['title']} Recording")
         # A tray app has no main window to parent to, so keep the prompt on
         # top rather than let it open behind the scan software.
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.settings = dict(settings)
         self.region = region
         self._timestamp = None  # fixed when the user presses Start
+        self.speed_spin = None
+        self.axis_combo = None
         self._build_ui()
         self.setMinimumWidth(460)
+
+    @property
+    def is_scan(self):
+        return self.mode == sidecar.KIND_SCAN
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
 
-        scan_group = QGroupBox("Scan")
+        scan_group = QGroupBox("Scan" if self.is_scan else "Taper in progress")
         scan_form = QFormLayout(scan_group)
 
-        self.speed_spin = QDoubleSpinBox()
-        self.speed_spin.setRange(0.1, 100000.0)
-        self.speed_spin.setDecimals(1)
-        self.speed_spin.setSuffix(" µm/s")
-        self.speed_spin.setValue(float(self.settings.get("scan_speed", 1000.0)))
-        self.speed_spin.setToolTip(
-            "Stage speed for this scan. It goes in the file name and the "
-            "metadata sidecar, and sets the pixel scale during reconstruction."
-        )
-        self.speed_spin.valueChanged.connect(self._update_preview)
-        scan_form.addRow("Scan speed:", self.speed_spin)
+        if self.is_scan:
+            self.speed_spin = QDoubleSpinBox()
+            self.speed_spin.setRange(0.1, 100000.0)
+            self.speed_spin.setDecimals(1)
+            self.speed_spin.setSuffix(" µm/s")
+            self.speed_spin.setValue(float(self.settings.get("scan_speed", 1000.0)))
+            self.speed_spin.setToolTip(
+                "Stage speed for this scan. It goes in the file name and the "
+                "metadata sidecar, and sets the pixel scale during reconstruction."
+            )
+            self.speed_spin.valueChanged.connect(self._update_preview)
+            scan_form.addRow("Scan speed:", self.speed_spin)
+        else:
+            note = QLabel(
+                "Records the taper being drawn as an ordinary video. No scan "
+                "speed is needed and the result is not reconstructed."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet("color: gray;")
+            scan_form.addRow(note)
 
         self.label_edit = QLineEdit(self.settings.get("scan_label", ""))
         self.label_edit.setPlaceholderText("optional — e.g. lantern7_run2")
         self.label_edit.textChanged.connect(self._update_preview)
         scan_form.addRow("Sample label:", self.label_edit)
 
-        self.axis_combo = QComboBox()
-        self.axis_combo.addItems(["Horizontal (left-right)", "Vertical (top-bottom)"])
-        self.axis_combo.setCurrentIndex(0 if self.settings.get("axis", 1) == 1 else 1)
-        self.axis_combo.setToolTip(
-            "Direction the taper moves across the capture region. Stored with "
-            "the recording and used to align the frames."
-        )
-        scan_form.addRow("Scan axis:", self.axis_combo)
+        if self.is_scan:
+            self.axis_combo = QComboBox()
+            self.axis_combo.addItems(
+                ["Horizontal (left-right)", "Vertical (top-bottom)"]
+            )
+            self.axis_combo.setCurrentIndex(
+                0 if self.settings.get("axis", 1) == 1 else 1
+            )
+            self.axis_combo.setToolTip(
+                "Direction the taper moves across the capture region. Stored "
+                "with the recording and used to align the frames."
+            )
+            scan_form.addRow("Scan axis:", self.axis_combo)
 
+        fps_key = self.mode_info["fps_key"]
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 60)
-        self.fps_spin.setValue(int(self.settings.get("fps", 15)))
+        self.fps_spin.setValue(int(self.settings.get(fps_key, DEFAULT_SETTINGS[fps_key])))
+        if not self.is_scan:
+            self.fps_spin.setToolTip(
+                "A taper draw runs for minutes; a few frames per second keeps "
+                "the file small while still showing the shape develop."
+            )
         scan_form.addRow("Frame rate:", self.fps_spin)
 
         self.notes_edit = QLineEdit()
         self.notes_edit.setPlaceholderText(
-            "optional — objective, fibre ID, anything worth keeping with the scan"
+            "optional — objective, fibre ID, anything worth keeping with the recording"
         )
         scan_form.addRow("Notes:", self.notes_edit)
 
@@ -901,8 +955,8 @@ class RecordingSetupDialog(QDialog):
 
         if self.region:
             region_label = QLabel(
-                f"Region: {self.region[2]} × {self.region[3]} px at "
-                f"({self.region[0]}, {self.region[1]})"
+                f"{self.mode_info['title']} region: {self.region[2]} × "
+                f"{self.region[3]} px at ({self.region[0]}, {self.region[1]})"
             )
             region_label.setStyleSheet("color: gray;")
             layout.addWidget(region_label)
@@ -937,8 +991,12 @@ class RecordingSetupDialog(QDialog):
         right now; after Start is pressed the timestamp is fixed, so the
         name written to disk is the one the recording actually began with.
         """
-        return sidecar.build_video_filename(
-            self.speed_spin.value(), self.label_edit.text(), self._timestamp
+        if self.is_scan:
+            return sidecar.build_video_filename(
+                self.speed_spin.value(), self.label_edit.text(), self._timestamp
+            )
+        return sidecar.build_process_filename(
+            self.label_edit.text(), self._timestamp
         )
 
     def accept(self):
@@ -957,16 +1015,18 @@ class RecordingSetupDialog(QDialog):
         super().accept()
 
     def values(self):
-        return {
+        values = {
             "output_dir": self.dir_edit.text().strip(),
-            "scan_speed": self.speed_spin.value(),
             "scan_label": self.label_edit.text().strip(),
-            "axis": 1 if self.axis_combo.currentIndex() == 0 else 0,
-            "fps": self.fps_spin.value(),
+            self.mode_info["fps_key"]: self.fps_spin.value(),
             "notes": self.notes_edit.text().strip(),
             "show_overlay": self.overlay_cb.isChecked(),
             "overlay_preview": self.overlay_preview_cb.isChecked(),
         }
+        if self.is_scan:
+            values["scan_speed"] = self.speed_spin.value()
+            values["axis"] = 1 if self.axis_combo.currentIndex() == 0 else 0
+        return values
 
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1072,15 @@ class ReconstructionDialog(QDialog):
         layout.addWidget(file_label)
         if d.get("label"):
             layout.addWidget(self._source_label(f"Sample label: {d['label']}"))
+        if d.get("kind_warn"):
+            layout.addWidget(
+                self._source_label(
+                    "This is a recording of the taper in progress, not a "
+                    "diameter scan. Reconstruction expects frames moving at a "
+                    "steady speed and will not produce a meaningful image here.",
+                    warn=True,
+                )
+            )
 
         form = QFormLayout()
 
@@ -1100,7 +1169,14 @@ class SettingsDialog(QDialog):
         self.fps_spin = QSpinBox()
         self.fps_spin.setRange(1, 60)
         self.fps_spin.setValue(self.settings["fps"])
-        rec_form.addRow("Frame rate (fps):", self.fps_spin)
+        rec_form.addRow("Scan frame rate (fps):", self.fps_spin)
+
+        self.process_fps_spin = QSpinBox()
+        self.process_fps_spin.setRange(1, 60)
+        self.process_fps_spin.setValue(
+            int(self.settings.get("process_fps", DEFAULT_SETTINGS["process_fps"]))
+        )
+        rec_form.addRow("Process frame rate (fps):", self.process_fps_spin)
 
         self.overlay_cb = QCheckBox("Outline the captured region while recording")
         self.overlay_cb.setChecked(self.settings.get("show_overlay", True))
@@ -1182,6 +1258,7 @@ class SettingsDialog(QDialog):
             **self.settings,
             "output_dir": self.dir_edit.text(),
             "fps": self.fps_spin.value(),
+            "process_fps": self.process_fps_spin.value(),
             "scan_speed": self.speed_spin.value(),
             "skip": self.skip_spin.value(),
             "tolerance": self.tol_spin.value(),
@@ -1207,14 +1284,19 @@ class TaperRecorderApp(QObject):
         self.settings = load_settings()
         self.recorder = None
         self.recording = False
+        self.recording_mode = None
         self.current_video_path = None
         self.current_scan_speed = None
+        self.last_scan_video_path = None
         self.region_selector = None
         self.last_log_path = app_log_path()
         self._record_start_time = None
         self._sct = None
 
-        self.overlay = CaptureOverlay(self)
+        self.overlays = {
+            mode: CaptureOverlay(self, idle_colour=info["idle_colour"])
+            for mode, info in MODES.items()
+        }
 
         self._setup_tray()
         self._update_status_timer = QTimer(self)
@@ -1254,29 +1336,37 @@ class TaperRecorderApp(QObject):
 
         menu = QMenu()
 
-        self.select_action = QAction("Select Region...", self)
-        self.select_action.triggered.connect(self.select_region)
-        menu.addAction(self.select_action)
+        self.select_actions = {}
+        self.region_labels = {}
+        for mode, info in MODES.items():
+            action = QAction(f"Select {info['title']} Region...", self)
+            action.triggered.connect(lambda _=False, m=mode: self.select_region(m))
+            menu.addAction(action)
+            self.select_actions[mode] = action
 
-        self.region_label = QAction("No region selected", self)
-        self.region_label.setEnabled(False)
-        menu.addAction(self.region_label)
-        self._update_region_label()
+            label = QAction("", self)
+            label.setEnabled(False)
+            menu.addAction(label)
+            self.region_labels[mode] = label
+        self._update_region_labels()
 
-        self.overlay_action = QAction("Show Region Overlay", self)
+        self.overlay_action = QAction("Show Region Overlays", self)
         self.overlay_action.setCheckable(True)
         self.overlay_action.setToolTip(
-            "Outline the captured region on screen so you can confirm the "
-            "scan is in the right spot before recording."
+            "Outline the capture regions on screen so you can confirm they "
+            "are in the right spot before recording."
         )
         self.overlay_action.toggled.connect(self._toggle_idle_overlay)
         menu.addAction(self.overlay_action)
 
         menu.addSeparator()
 
-        self.record_action = QAction("Start Recording...", self)
-        self.record_action.triggered.connect(self.toggle_recording)
-        menu.addAction(self.record_action)
+        self.record_actions = {}
+        for mode, info in MODES.items():
+            action = QAction(f"Start {info['title']} Recording...", self)
+            action.triggered.connect(lambda _=False, m=mode: self.toggle_recording(m))
+            menu.addAction(action)
+            self.record_actions[mode] = action
 
         self.status_action = QAction("", self)
         self.status_action.setEnabled(False)
@@ -1285,7 +1375,7 @@ class TaperRecorderApp(QObject):
 
         menu.addSeparator()
 
-        self.recon_action = QAction("Reconstruct Last Recording...", self)
+        self.recon_action = QAction("Reconstruct Last Scan...", self)
         self.recon_action.triggered.connect(self.reconstruct_last)
         self.recon_action.setEnabled(False)
         menu.addAction(self.recon_action)
@@ -1321,12 +1411,14 @@ class TaperRecorderApp(QObject):
         self.tray.setContextMenu(menu)
         self.tray.show()
 
-    def _update_region_label(self):
-        r = self.settings.get("region")
-        if r:
-            self.region_label.setText(f"Region: {r[0]},{r[1]} — {r[2]}×{r[3]}")
-        else:
-            self.region_label.setText("No region selected")
+    def _update_region_labels(self):
+        for mode, info in MODES.items():
+            r = self.settings.get(info["region_key"])
+            if r:
+                text = f"{info['title']} region: {r[0]},{r[1]} — {r[2]}×{r[3]}"
+            else:
+                text = f"No {info['title'].lower()} region selected"
+            self.region_labels[mode].setText(text)
 
     def _show_tray_message(self, title, msg, icon, timeout):
         self.tray.showMessage(title, msg, icon, timeout)
@@ -1357,24 +1449,28 @@ class TaperRecorderApp(QObject):
             screen = QApplication.primaryScreen()
         return float(screen.devicePixelRatio()) if screen else 1.0
 
-    def _region_rect(self):
-        r = self.settings.get("region")
+    def _region(self, mode):
+        """Stored [x, y, w, h] for a mode, or None."""
+        return self.settings.get(MODES[mode]["region_key"])
+
+    def _region_rect(self, mode):
+        r = self._region(mode)
         return QRect(r[0], r[1], r[2], r[3]) if r else None
 
     def _on_tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             if self.recording:
-                self.toggle_recording()
-            elif self.settings.get("region"):
-                self.toggle_recording()
+                self._stop_recording()
+            elif self._region(sidecar.KIND_SCAN):
+                self._start_recording(sidecar.KIND_SCAN)
             else:
-                self.select_region()
+                self.select_region(sidecar.KIND_SCAN)
 
     # --- Region selection ---
-    def select_region(self):
-        initial = self._region_rect()
-        # The overlay would sit on top of the selector, so hide it for the
-        # duration and put it back if the selection is cancelled.
+    def select_region(self, mode=sidecar.KIND_SCAN):
+        initial = self._region_rect(mode)
+        # The overlays would sit on top of the selector, so hide them for
+        # the duration and put them back if the selection is cancelled.
         was_previewing = self.overlay_action.isChecked()
         if was_previewing:
             self.overlay_action.setChecked(False)
@@ -1384,25 +1480,34 @@ class TaperRecorderApp(QObject):
                 self.overlay_action.setChecked(True)
 
         self.region_selector = RegionSelector(initial)
-        self.region_selector.region_selected.connect(self._on_region_selected)
+        self.region_selector.region_selected.connect(
+            lambda rect, m=mode: self._on_region_selected(m, rect)
+        )
         self.region_selector.closed.connect(_restore_overlay)
         self.region_selector.show()
         self.region_selector.raise_()
         self.region_selector.activateWindow()
 
-    def _on_region_selected(self, rect):
-        self.settings["region"] = [rect.x(), rect.y(), rect.width(), rect.height()]
+    def _on_region_selected(self, mode, rect):
+        info = MODES[mode]
+        self.settings[info["region_key"]] = [
+            rect.x(),
+            rect.y(),
+            rect.width(),
+            rect.height(),
+        ]
         save_settings(self.settings)
-        self._update_region_label()
+        self._update_region_labels()
         log.info(
-            "Region selected: %d×%d at (%d, %d)",
+            "%s region selected: %d×%d at (%d, %d)",
+            info["title"],
             rect.width(),
             rect.height(),
             rect.x(),
             rect.y(),
         )
         self.tray.showMessage(
-            "Region Selected",
+            f"{info['title']} Region Selected",
             f"{rect.width()} × {rect.height()} at ({rect.x()}, {rect.y()})",
             QSystemTrayIcon.MessageIcon.Information,
             2000,
@@ -1411,40 +1516,54 @@ class TaperRecorderApp(QObject):
         self.overlay_action.setChecked(True)
 
     # --- Overlay ---
+    def _hide_overlays(self):
+        for overlay in self.overlays.values():
+            overlay.hide()
+
     def _toggle_idle_overlay(self, checked):
         if self.recording:
-            # Mid-scan the overlay is the recording one; let it be shown or
-            # dismissed, but leave the idle preview grabber alone.
+            # Mid-recording the overlay is the recording one; let it be shown
+            # or dismissed, but leave the idle preview grabber alone.
+            overlay = self.overlays[self.recording_mode]
             if checked:
-                self.overlay.show(self._region_rect(), recording=True, show_panel=True)
+                overlay.show(
+                    self._region_rect(self.recording_mode),
+                    recording=True,
+                    show_panel=True,
+                )
                 self._update_recording_status()
             else:
-                self.overlay.hide()
+                overlay.hide()
             return
         if checked:
-            region = self._region_rect()
-            if region is None:
+            regions = {
+                mode: self._region_rect(mode)
+                for mode in MODES
+                if self._region(mode)
+            }
+            if not regions:
                 self.overlay_action.setChecked(False)
                 self.tray.showMessage(
                     "No Region",
-                    "Select a screen region first.",
+                    "Select a scan or process region first.",
                     QSystemTrayIcon.MessageIcon.Warning,
                     3000,
                 )
                 return
-            self.overlay.show(region, recording=False, show_panel=True)
+            for mode, overlay in self.overlays.items():
+                if mode in regions:
+                    overlay.show(regions[mode], recording=False, show_panel=True)
+                else:
+                    overlay.hide()
             self._update_idle_overlay()
             self._preview_timer.start(250)
         else:
             self._preview_timer.stop()
             self._close_grabber()
-            self.overlay.hide()
+            self._hide_overlays()
 
-    def _grab_region(self):
-        """Grab the region once for the idle preview (GUI thread)."""
-        region = self.settings.get("region")
-        if not region:
-            return None
+    def _grab_region(self, region):
+        """Grab a region once for the idle preview (GUI thread)."""
         try:
             if self._sct is None:
                 self._sct = mss.mss()
@@ -1466,71 +1585,85 @@ class TaperRecorderApp(QObject):
     def _update_idle_overlay(self):
         if self.recording or not self.overlay_action.isChecked():
             return
-        region = self.settings.get("region")
-        if not region:
-            return
-        frame = (
-            self._grab_region()
-            if self.settings.get("overlay_preview", True)
-            else None
-        )
-        lines = [
-            f"{region[2]} × {region[3]} px at ({region[0]}, {region[1]})",
-            f"{self.settings.get('scan_speed', 0):g} µm/s · "
-            f"{self.settings.get('fps', 0)} fps (last used)",
-        ]
-        self.overlay.update_status("Region preview", lines, frame)
+        want_preview = self.settings.get("overlay_preview", True)
+        for mode, info in MODES.items():
+            region = self._region(mode)
+            overlay = self.overlays[mode]
+            if not region or not overlay.visible:
+                continue
+            frame = self._grab_region(region) if want_preview else None
+            fps = self.settings.get(info["fps_key"], DEFAULT_SETTINGS[info["fps_key"]])
+            if mode == sidecar.KIND_SCAN:
+                last_used = f"{self.settings.get('scan_speed', 0):g} µm/s · {fps} fps (last used)"
+            else:
+                last_used = f"{fps} fps (last used)"
+            lines = [
+                f"{region[2]} × {region[3]} px at ({region[0]}, {region[1]})",
+                last_used,
+            ]
+            overlay.update_status(f"{info['title']} region preview", lines, frame)
 
     # --- Recording ---
-    def toggle_recording(self):
+    def toggle_recording(self, mode=sidecar.KIND_SCAN):
         if self.recording:
             self._stop_recording()
         else:
-            self._start_recording()
+            self._start_recording(mode)
 
-    def _start_recording(self):
-        region = self.settings.get("region")
+    def _start_recording(self, mode=sidecar.KIND_SCAN):
+        info = MODES[mode]
+        region = self._region(mode)
         if not region:
-            log.warning("Start requested with no region selected")
+            log.warning("Start requested with no %s region selected", info["title"].lower())
             self.tray.showMessage(
                 "No Region",
-                "Please select a screen region first.",
+                f"Please select the {info['title'].lower()} region first.",
                 QSystemTrayIcon.MessageIcon.Warning,
                 3000,
             )
             return
 
-        dialog = RecordingSetupDialog(self.settings, region)
+        dialog = RecordingSetupDialog(self.settings, region, mode)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            log.info("Recording cancelled at the setup dialog")
+            log.info("%s recording cancelled at the setup dialog", info["title"])
             return
 
         values = dialog.values()
-        notes = values.pop("notes")  # per-scan, belongs in the sidecar only
+        notes = values.pop("notes")  # per-recording, belongs in the sidecar only
         self.settings.update(values)
         save_settings(self.settings)
 
         out_dir = Path(values["output_dir"])
         video_path = str(out_dir / dialog.filename())
-        scan_speed = values["scan_speed"]
-        fps = values["fps"]
+        fps = values[info["fps_key"]]
+        scan_speed = values.get("scan_speed")
 
         region_dict = self._region_for_mss(region)
         metadata = {
-            "scan_speed_um_s": scan_speed,
+            "kind": mode,
             "label": values["scan_label"],
             "notes": notes,
-            "axis": values["axis"],
-            "skip": self.settings.get("skip", 1),
-            "tolerance": self.settings.get("tolerance", 0.3),
-            "compress": self.settings.get("compress", 1.0),
             "region_logical": list(region),
             "device_pixel_ratio": self._device_pixel_ratio(region),
         }
-
-        log.info(
-            "Starting recording: %s (%.1f µm/s, %d fps)", video_path, scan_speed, fps
-        )
+        if mode == sidecar.KIND_SCAN:
+            metadata.update(
+                {
+                    "scan_speed_um_s": scan_speed,
+                    "axis": values["axis"],
+                    "skip": self.settings.get("skip", 1),
+                    "tolerance": self.settings.get("tolerance", 0.3),
+                    "compress": self.settings.get("compress", 1.0),
+                }
+            )
+            log.info(
+                "Starting scan recording: %s (%.1f µm/s, %d fps)",
+                video_path,
+                scan_speed,
+                fps,
+            )
+        else:
+            log.info("Starting process recording: %s (%d fps)", video_path, fps)
 
         self.recorder = ScreenRecorder(
             region=region_dict,
@@ -1539,34 +1672,42 @@ class TaperRecorderApp(QObject):
             metadata=metadata,
             capture_preview=bool(values["overlay_preview"]),
         )
-        self.recorder.signals.finished.connect(self._on_recording_finished)
+        self.recorder.signals.finished.connect(
+            lambda path, m=mode: self._on_recording_finished(m, path)
+        )
         self.recorder.signals.error.connect(self._on_recording_error)
         self.recorder.start()
 
         self.recording = True
+        self.recording_mode = mode
         self.current_video_path = video_path
         self.current_scan_speed = scan_speed
         self.last_log_path = self.recorder.log_path
-        self.record_action.setText("Stop Recording")
-        self.select_action.setEnabled(False)
+        for m, action in self.record_actions.items():
+            if m == mode:
+                action.setText(f"Stop {info['title']} Recording")
+            else:
+                action.setEnabled(False)
+        for action in self.select_actions.values():
+            action.setEnabled(False)
         self.tray.setIcon(self._create_icon(recording=True))
+        detail = f"{scan_speed:g} µm/s" if scan_speed else f"{fps} fps"
         self.tray.setToolTip(
-            f"Taper Scan Recorder — RECORDING ({scan_speed:g} µm/s)"
+            f"Taper Scan Recorder — RECORDING {info['title'].upper()} ({detail})"
         )
         self.status_action.setVisible(True)
         self._record_start_time = time.time()
 
-        # Swap the idle preview for the recording overlay
+        # Swap the idle previews for this mode's recording overlay
         self._preview_timer.stop()
         self._close_grabber()
+        self._hide_overlays()
         if values["show_overlay"]:
-            self.overlay.show(
-                self._region_rect(),
+            self.overlays[mode].show(
+                self._region_rect(mode),
                 recording=True,
                 show_panel=True,
             )
-        else:
-            self.overlay.hide()
         # Keep the menu's check mark truthful without re-triggering the slot
         self.overlay_action.blockSignals(True)
         self.overlay_action.setChecked(bool(values["show_overlay"]))
@@ -1575,32 +1716,39 @@ class TaperRecorderApp(QObject):
         self._update_recording_status()
 
         self.tray.showMessage(
-            "Recording Started",
-            f"{scan_speed:g} µm/s → {Path(video_path).name}",
+            f"{info['title']} Recording Started",
+            f"{detail} → {Path(video_path).name}",
             QSystemTrayIcon.MessageIcon.Information,
             2000,
         )
 
-    def _stop_recording(self):
-        log.info("Stopping recording")
-        if self.recorder:
-            self.recorder.stop()
+    def _reset_recording_ui(self):
         self.recording = False
-        self.record_action.setText("Start Recording...")
-        self.select_action.setEnabled(True)
+        self.recording_mode = None
+        for mode, action in self.record_actions.items():
+            action.setText(f"Start {MODES[mode]['title']} Recording...")
+            action.setEnabled(True)
+        for action in self.select_actions.values():
+            action.setEnabled(True)
         self.tray.setIcon(self._create_icon(recording=False))
         self.tray.setToolTip("Taper Scan Recorder")
         self._update_status_timer.stop()
         self.status_action.setVisible(False)
 
-        # Back to the idle overlay if it was left switched on
+    def _stop_recording(self):
+        log.info("Stopping recording")
+        if self.recorder:
+            self.recorder.stop()
+        self._reset_recording_ui()
+
+        # Back to the idle overlays if they were left switched on
         if self.overlay_action.isChecked():
             self._toggle_idle_overlay(True)
         else:
-            self.overlay.hide()
+            self._hide_overlays()
 
     def _update_recording_status(self):
-        if not self.recorder:
+        if not self.recorder or self.recording_mode is None:
             return
         elapsed = time.time() - self._record_start_time
         mins, secs = divmod(int(elapsed), 60)
@@ -1608,7 +1756,8 @@ class TaperRecorderApp(QObject):
         rate = n / elapsed if elapsed > 0 else 0.0
         self.status_action.setText(f"  {mins:02d}:{secs:02d}  |  {n} frames")
 
-        if self.overlay.visible:
+        overlay = self.overlays[self.recording_mode]
+        if overlay.visible:
             lines = [
                 f"{n} frames · {rate:.1f} fps",
                 f"{self.current_scan_speed:g} µm/s"
@@ -1618,27 +1767,30 @@ class TaperRecorderApp(QObject):
                 if self.current_video_path
                 else "",
             ]
-            self.overlay.update_status(
-                f"REC  {mins:02d}:{secs:02d}",
+            overlay.update_status(
+                f"REC {MODES[self.recording_mode]['title'].upper()}  {mins:02d}:{secs:02d}",
                 [line for line in lines if line],
                 self.recorder.latest_preview(),
             )
 
-    def _on_recording_finished(self, path):
-        self.recon_action.setEnabled(True)
+    def _on_recording_finished(self, mode, path):
         stats = self.recorder.stats if self.recorder else {}
         n = stats.get("frame_count", self.recorder.frame_count if self.recorder else 0)
         effective = stats.get("effective_fps")
-        log.info("Recording finished: %s (%s frames)", path, n)
+        log.info("%s recording finished: %s (%s frames)", MODES[mode]["title"], path, n)
         detail = f"{n} frames saved to {Path(path).name}"
         if effective:
             detail += f"\nMeasured {effective:.2f} fps"
         self.tray.showMessage(
-            "Recording Complete",
+            f"{MODES[mode]['title']} Recording Complete",
             detail,
             QSystemTrayIcon.MessageIcon.Information,
             3000,
         )
+        if mode != sidecar.KIND_SCAN:
+            return  # a process video is the finished product
+        self.last_scan_video_path = path
+        self.recon_action.setEnabled(True)
         if self.settings.get("auto_reconstruct"):
             # Values were typed into the setup dialog moments ago; no need
             # to confirm them again.
@@ -1646,13 +1798,8 @@ class TaperRecorderApp(QObject):
 
     def _on_recording_error(self, msg):
         log.error("Recording error: %s", msg)
-        self.recording = False
-        self.record_action.setText("Start Recording...")
-        self.select_action.setEnabled(True)
-        self.tray.setIcon(self._create_icon(recording=False))
-        self._update_status_timer.stop()
-        self.status_action.setVisible(False)
-        self.overlay.hide()
+        self._reset_recording_ui()
+        self._hide_overlays()
         self.tray.showMessage(
             "Recording Error",
             f"{msg}\nLog: {self.last_log_path}",
@@ -1662,12 +1809,12 @@ class TaperRecorderApp(QObject):
 
     # --- Reconstruction ---
     def reconstruct_last(self):
-        if self.current_video_path and Path(self.current_video_path).exists():
-            self._run_reconstruction(self.current_video_path)
+        if self.last_scan_video_path and Path(self.last_scan_video_path).exists():
+            self._run_reconstruction(self.last_scan_video_path)
         else:
             self.tray.showMessage(
                 "Nothing to Reconstruct",
-                "No recording from this session was found.",
+                "No scan recording from this session was found.",
                 QSystemTrayIcon.MessageIcon.Warning,
                 3000,
             )
@@ -1696,7 +1843,12 @@ class TaperRecorderApp(QObject):
         if not np.isfinite(container_fps):
             container_fps = 0.0
 
-        d = {"label": params.get("label"), "container_fps": container_fps}
+        d = {
+            "label": params.get("label"),
+            "container_fps": container_fps,
+            "kind": params.get("kind"),
+            "kind_warn": params.get("kind") == sidecar.KIND_PROCESS,
+        }
 
         if "scan_speed" in params:
             d["scan_speed"] = params["scan_speed"]
@@ -1758,6 +1910,12 @@ class TaperRecorderApp(QObject):
         s = dict(self.settings)
 
         defaults = self._reconstruction_defaults(video_path)
+        if defaults["kind_warn"]:
+            log.warning(
+                "%s is a process recording (taper in progress), not a scan; "
+                "reconstruction is unlikely to be meaningful",
+                Path(video_path).name,
+            )
         sources = {
             "scan_speed": defaults["speed_source"],
             "axis": defaults["axis_source"],
@@ -1966,7 +2124,7 @@ class TaperRecorderApp(QObject):
             self._stop_recording()
         self._preview_timer.stop()
         self._close_grabber()
-        self.overlay.hide()
+        self._hide_overlays()
         save_settings(self.settings)
         QApplication.quit()
 
