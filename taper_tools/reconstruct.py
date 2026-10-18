@@ -14,20 +14,58 @@ Three alignment modes:
   - 'constant': uses the known scan speed, frame rate, and pixel scale
     to compute a fixed shift per frame (faster, but assumes constant speed).
 
+Videos recorded with the taper recorder carry a ``.meta.json`` sidecar
+holding the scan speed and the frame rate actually achieved during
+capture; both are picked up automatically, so ``--speed`` is only needed
+for videos from elsewhere.
+
+Every run writes a log (``<output>.log`` by default) with the full set of
+inputs, the alignment diagnostics and, if the run fails, the traceback.
+
 Usage:
-    python taper_reconstruct.py video.mp4 --speed 1000 --output taper.png
-    python taper_reconstruct.py video.mp4 --mode constant --speed 1000 --pixel_scale 1.5
+    taper-reconstruct video.mp4 --speed 1000 --output taper.png
+    taper-reconstruct video.mp4 --mode constant --speed 1000 --pixel_scale 1.5
 
 Author: Claude (for Chris @ SAIL)
 """
 
 import argparse
+import logging
 import sys
+import traceback
 from pathlib import Path
 
 import cv2
 import numpy as np
 from tqdm import tqdm
+
+from taper_tools import sidecar
+from taper_tools.logging_utils import (
+    app_log_path,
+    file_log,
+    log_environment,
+    setup_app_logging,
+)
+
+# Explicit name (not __name__) so the package handlers still catch these
+# records when the module is run as a script or from a frozen build.
+log = logging.getLogger("taper_tools.reconstruct")
+
+
+def _progress(iterable, total, desc):
+    """tqdm when we have a real terminal, plain iteration otherwise.
+
+    A windowed executable has no usable stderr, so the progress bar is
+    skipped there; the log gets percentage updates instead.
+    """
+    stderr = getattr(sys, "stderr", None)
+    try:
+        interactive = stderr is not None and stderr.isatty()
+    except Exception:
+        interactive = False
+    if not interactive:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc)
 
 
 def extract_frames(video_path, roi=None, skip=1):
@@ -117,6 +155,11 @@ def find_peak_shift(shifts):
     # Remove near-zero shifts (stationary frames / failed correlations)
     abs_shifts = abs_shifts[abs_shifts > 0.5]
     if len(abs_shifts) < 5:
+        log.warning(
+            "Only %d frames with a measurable shift; falling back to the median. "
+            "The scan may not have been moving, or the region may be static.",
+            len(abs_shifts),
+        )
         return float(np.median(np.abs(shifts)))
 
     try:
@@ -125,11 +168,13 @@ def find_peak_shift(shifts):
         kde = gaussian_kde(abs_shifts)
         x = np.linspace(abs_shifts.min(), abs_shifts.max(), 500)
         peak = x[np.argmax(kde(x))]
+        log.debug("Peak shift from scipy KDE over %d values", len(abs_shifts))
     except ImportError:
         # Fallback: histogram peak
         counts, edges = np.histogram(abs_shifts, bins="auto")
         peak_bin = np.argmax(counts)
         peak = (edges[peak_bin] + edges[peak_bin + 1]) / 2.0
+        log.debug("scipy unavailable; peak shift from histogram")
 
     return float(peak)
 
@@ -155,6 +200,7 @@ def reconstruct_taper(
     skip=1,
     blend=True,
     tolerance=0.3,
+    fps_override=None,
 ):
     """
     Reconstruct the full taper image from a scan video.
@@ -180,6 +226,11 @@ def reconstruct_taper(
     tolerance : float
         For 'auto' mode: fractional deviation from expected shift beyond
         which a frame's shift is replaced (default 0.3 = 30%).
+    fps_override : float, optional
+        Frame rate to use instead of the one stored in the container.
+        The recorder measures the rate it actually achieved and saves it
+        in the sidecar; if the capture ran slower than requested, the
+        container frame rate would bias the derived pixel scale.
 
     Returns
     -------
@@ -188,10 +239,46 @@ def reconstruct_taper(
     shifts : list of float
         Per-frame shifts in pixels.
     """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    log.info("--- reconstruction inputs ---")
+    log.info("  video        %s (%.1f MB)", video_path, video_path.stat().st_size / 1e6)
+    log.info("  mode         %s", mode)
+    log.info("  scan speed   %s um/s", scan_speed)
+    log.info("  pixel scale  %s um/px", pixel_scale)
+    log.info("  axis         %d (%s)", axis, "horizontal" if axis == 1 else "vertical")
+    log.info("  roi          %s", roi)
+    log.info("  skip         %d", skip)
+    log.info("  blend        %s", blend)
+    log.info("  tolerance    %s", tolerance)
+    log.info("  fps override %s", fps_override)
+    log.info("-----------------------------")
+
     fps, n_frames, vid_w, vid_h = get_video_info(video_path)
+    log.info("Video: %dx%d, %.1f fps, %d frames", vid_w, vid_h, fps, n_frames)
+
+    if fps_override:
+        log.info(
+            "Using measured capture rate %.4f fps instead of the container's %.4f fps",
+            float(fps_override),
+            fps,
+        )
+        fps = float(fps_override)
+
+    if not fps or not np.isfinite(fps) or fps <= 0:
+        raise ValueError(
+            f"Video reports an unusable frame rate ({fps}). "
+            "Pass an explicit frame rate to continue."
+        )
+    if n_frames < 2:
+        raise ValueError(
+            f"Video has {n_frames} frame(s); at least 2 are needed to stitch a taper."
+        )
+
     n_used = n_frames // skip
-    print(f"Video: {vid_w}x{vid_h}, {fps:.1f} fps, {n_frames} frames")
-    print(f"Using every {skip}-th frame -> ~{n_used} frames")
+    log.info("Using every %d-th frame -> ~%d frames", skip, n_used)
 
     # Validate mode requirements
     if mode == "constant":
@@ -201,18 +288,19 @@ def reconstruct_taper(
             )
         px_per_sec = scan_speed / pixel_scale
         constant_shift = px_per_sec / (fps / skip)
-        print(f"Constant shift: {constant_shift:.2f} px/frame")
+        log.info("Constant shift: %.2f px/frame", constant_shift)
     elif mode == "auto":
         if scan_speed is None:
             raise ValueError("scan_speed is required for 'auto' mode")
 
     # First pass: collect shifts
-    print("Pass 1: estimating shifts...")
+    log.info("Pass 1: estimating shifts...")
     shifts = []
     prev_frame = None
     frame_gen = extract_frames(video_path, roi=roi, skip=skip)
+    report_every = max(1, n_used // 10)
 
-    for i, frame in enumerate(tqdm(frame_gen, total=n_used, desc="Shifts")):
+    for i, frame in enumerate(_progress(frame_gen, n_used, "Shifts")):
         if prev_frame is not None:
             if mode == "constant":
                 shifts.append(constant_shift)
@@ -221,6 +309,15 @@ def reconstruct_taper(
                 s = estimate_shift_correlation(prev_frame, frame, axis=axis)
                 shifts.append(s)
         prev_frame = frame
+        if i and i % report_every == 0:
+            log.debug("  shifts: frame %d/%d", i, n_used)
+
+    if not shifts:
+        raise ValueError(
+            "No frame pairs were read from the video — it may be truncated or "
+            "the skip factor may exceed the frame count."
+        )
+    log.info("Measured %d inter-frame shifts", len(shifts))
 
     # Auto mode: find dominant shift, derive pixel scale, replace outliers
     if mode == "auto":
@@ -230,11 +327,26 @@ def reconstruct_taper(
         peak_shift = find_peak_shift(raw_shifts) * sign
         abs_peak = abs(peak_shift)
 
+        if abs_peak < 1e-6:
+            raise ValueError(
+                "No consistent frame-to-frame motion was detected. Check that "
+                "the captured region covers the moving taper image and that the "
+                "scan axis setting matches the direction of travel."
+            )
+
         # Derive pixel scale: speed [um/s] / (shift [px/frame] * fps/skip [frame/s])
         derived_pixel_scale = scan_speed / (abs_peak * fps / skip)
-        print(f"\n--- Auto mode diagnostics ---")
-        print(f"Peak shift: {peak_shift:.3f} px/frame")
-        print(f"Derived pixel scale: {derived_pixel_scale:.4f} um/px")
+        log.info("--- Auto mode diagnostics ---")
+        log.info("Peak shift: %.3f px/frame", peak_shift)
+        log.info("Derived pixel scale: %.4f um/px", derived_pixel_scale)
+        log.info(
+            "Raw shift stats: median %.3f, mean %.3f, std %.3f, min %.3f, max %.3f",
+            float(np.median(raw_shifts)),
+            float(np.mean(raw_shifts)),
+            float(np.std(raw_shifts)),
+            float(np.min(raw_shifts)),
+            float(np.max(raw_shifts)),
+        )
 
         # Replace outliers
         n_replaced = 0
@@ -245,9 +357,16 @@ def reconstruct_taper(
                 n_replaced += 1
 
         frac = n_replaced / len(shifts) * 100
-        print(f"Replaced {n_replaced}/{len(shifts)} shifts ({frac:.1f}%)")
-        print(f"Shift range (after): [{min(shifts):.3f}, {max(shifts):.3f}]")
-        print(f"-----------------------------\n")
+        log.info("Replaced %d/%d shifts (%.1f%%)", n_replaced, len(shifts), frac)
+        log.info("Shift range (after): [%.3f, %.3f]", min(shifts), max(shifts))
+        log.info("-----------------------------")
+        if frac > 50:
+            log.warning(
+                "More than half the shifts were replaced (%.1f%%). The scan speed, "
+                "frame rate or scan axis may be wrong, or the scan may have "
+                "stalled part-way through.",
+                frac,
+            )
 
     # Compute cumulative positions
     cum_shifts = np.cumsum(shifts)
@@ -255,15 +374,20 @@ def reconstruct_taper(
 
     # Handle negative shifts (scan could go either direction)
     if cum_shifts[-1] < 0:
-        print("Detected reverse scan direction, flipping.")
+        log.info("Detected reverse scan direction, flipping.")
         cum_shifts = -cum_shifts
 
-    # Print some diagnostics
-    total_travel = cum_shifts[-1]
+    # Frames are placed at whole pixels; shift the whole run so the
+    # earliest frame starts at zero (a 'correlation' run can wander
+    # backwards, which would otherwise index the canvas from the end).
+    positions = np.round(cum_shifts).astype(int)
+    positions -= positions.min()
+    total_travel = int(positions.max())
+
     mean_shift = np.mean(np.abs(shifts))
     std_shift = np.std(shifts)
-    print(f"Mean shift: {mean_shift:.2f} px/frame (std: {std_shift:.2f})")
-    print(f"Total travel: {total_travel:.0f} px")
+    log.info("Mean shift: %.2f px/frame (std: %.2f)", mean_shift, std_shift)
+    log.info("Total travel: %d px", total_travel)
 
     # Work out the output image size
     # Get a sample frame to know dimensions
@@ -271,16 +395,23 @@ def reconstruct_taper(
     fh, fw = sample.shape[:2]
 
     if axis == 1:
-        out_w = int(np.ceil(total_travel)) + fw
+        out_w = total_travel + fw
         out_h = fh
     else:
         out_w = fw
-        out_h = int(np.ceil(total_travel)) + fh
+        out_h = total_travel + fh
 
-    print(f"Output image: {out_w} x {out_h} px")
+    megapixels = out_w * out_h / 1e6
+    log.info("Output image: %d x %d px (%.1f MP)", out_w, out_h, megapixels)
+    if megapixels > 400:
+        log.warning(
+            "The output image is very large (%.0f MP). If this runs out of memory, "
+            "raise the frame skip or lower the scan speed used for alignment.",
+            megapixels,
+        )
 
     # Second pass: composite
-    print("Pass 2: compositing...")
+    log.info("Pass 2: compositing...")
     result = np.zeros((out_h, out_w), dtype=np.float64)
     weight = np.zeros((out_h, out_w), dtype=np.float64)
 
@@ -289,25 +420,29 @@ def reconstruct_taper(
         if axis == 1:
             ramp = np.ones(fw, dtype=np.float64)
             blend_width = min(fw // 4, 50)
-            ramp[:blend_width] = np.linspace(0, 1, blend_width)
-            ramp[-blend_width:] = np.linspace(1, 0, blend_width)
+            # Endpoints excluded: a weight of exactly zero would leave the
+            # outermost column of the composite uncovered.
+            edge = np.linspace(0, 1, blend_width + 2)[1:-1]
+            ramp[:blend_width] = edge
+            ramp[-blend_width:] = edge[::-1]
             mask = np.tile(ramp, (fh, 1))
         else:
             ramp = np.ones(fh, dtype=np.float64)
             blend_width = min(fh // 4, 50)
-            ramp[:blend_width] = np.linspace(0, 1, blend_width)
-            ramp[-blend_width:] = np.linspace(1, 0, blend_width)
+            edge = np.linspace(0, 1, blend_width + 2)[1:-1]
+            ramp[:blend_width] = edge
+            ramp[-blend_width:] = edge[::-1]
             mask = np.tile(ramp[:, None], (1, fw))
     else:
         mask = np.ones((fh, fw), dtype=np.float64)
 
     frame_gen = extract_frames(video_path, roi=roi, skip=skip)
-    for i, frame in enumerate(tqdm(frame_gen, total=n_used, desc="Composite")):
-        pos = cum_shifts[i]
-        # Integer position (we do nearest-pixel placement; sub-pixel
-        # accuracy comes from the blending of many overlapping frames)
+    for i, frame in enumerate(_progress(frame_gen, n_used, "Composite")):
+        # Nearest-pixel placement; sub-pixel accuracy comes from the
+        # blending of many overlapping frames
+        pos = int(positions[i])
         if axis == 1:
-            x0 = int(round(pos))
+            x0 = pos
             x1 = x0 + fw
             if x1 > out_w:
                 # Trim if we overshoot slightly
@@ -320,7 +455,7 @@ def reconstruct_taper(
                 result[:, x0:x1] += frame.astype(np.float64) * mask
                 weight[:, x0:x1] += mask
         else:
-            y0 = int(round(pos))
+            y0 = pos
             y1 = y0 + fh
             if y1 > out_h:
                 trim = y1 - out_h
@@ -331,12 +466,33 @@ def reconstruct_taper(
             else:
                 result[y0:y1, :] += frame.astype(np.float64) * mask
                 weight[y0:y1, :] += mask
+        if i and i % report_every == 0:
+            log.debug("  composite: frame %d/%d", i, n_used)
 
     # Normalise
+    n_empty = int(np.count_nonzero(weight == 0))
+    if n_empty:
+        log.warning(
+            "%d output pixels (%.2f%%) were never covered by a frame — there is a "
+            "gap in the scan.",
+            n_empty,
+            100.0 * n_empty / weight.size,
+        )
     weight[weight == 0] = 1.0
     result = (result / weight).astype(np.uint8)
+    log.info("Composite complete")
 
     return result, shifts
+
+
+def compress_along_axis(image, factor, axis=1):
+    """Shrink ``image`` by ``factor`` along the scan axis."""
+    h, w = image.shape[:2]
+    if axis == 1:
+        new_w = max(1, int(round(w / factor)))
+        return cv2.resize(image, (new_w, h), interpolation=cv2.INTER_AREA)
+    new_h = max(1, int(round(h / factor)))
+    return cv2.resize(image, (w, new_h), interpolation=cv2.INTER_AREA)
 
 
 def main():
@@ -360,7 +516,8 @@ def main():
         "--speed",
         type=float,
         default=None,
-        help="Scan speed in um/s (required for 'auto' and 'constant' modes)",
+        help="Scan speed in um/s (required for 'auto' and 'constant' modes; "
+        "read from the recording sidecar or file name when omitted)",
     )
     parser.add_argument(
         "--pixel_scale",
@@ -378,8 +535,9 @@ def main():
         "--axis",
         type=int,
         choices=[0, 1],
-        default=1,
-        help="Scan axis: 1=horizontal, 0=vertical (default: 1)",
+        default=None,
+        help="Scan axis: 1=horizontal, 0=vertical (default: the axis stored in "
+        "the recording sidecar, else 1=horizontal)",
     )
     parser.add_argument(
         "--roi",
@@ -407,42 +565,111 @@ def main():
         help="Compress the scan axis by this factor (e.g. 10 = 10:1 shrink along scan axis)",
     )
     parser.add_argument(
+        "--fps",
+        type=float,
+        default=None,
+        help="Frame rate to use instead of the container's (defaults to the "
+        "rate measured during recording, when a sidecar is present)",
+    )
+    parser.add_argument(
+        "--ignore-sidecar",
+        action="store_true",
+        help="Ignore the recording's .meta.json sidecar",
+    )
+    parser.add_argument(
         "--save-shifts",
         action="store_true",
         help="Save per-frame shifts to a .npy file",
     )
+    parser.add_argument(
+        "--log",
+        default=None,
+        help="Log file path (default: <output>.log)",
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="Do not write a per-run log file",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print debug-level detail to the console",
+    )
 
     args = parser.parse_args()
 
-    result, shifts = reconstruct_taper(
-        video_path=args.video,
-        mode=args.mode,
-        scan_speed=args.speed,
-        pixel_scale=args.pixel_scale,
-        axis=args.axis,
-        roi=tuple(args.roi) if args.roi else None,
-        skip=args.skip,
-        blend=not args.no_blend,
-        tolerance=args.tolerance,
-    )
+    setup_app_logging(level=logging.DEBUG if args.verbose else logging.INFO)
 
-    if args.compress is not None and args.compress > 1:
-        h, w = result.shape[:2]
-        if args.axis == 1:
-            new_w = max(1, int(round(w / args.compress)))
-            result = cv2.resize(result, (new_w, h), interpolation=cv2.INTER_AREA)
-        else:
-            new_h = max(1, int(round(h / args.compress)))
-            result = cv2.resize(result, (w, new_h), interpolation=cv2.INTER_AREA)
-        print(f"Compressed {args.compress:.1f}x along scan axis -> {result.shape[1]} x {result.shape[0]} px")
+    log_path = None
+    if not args.no_log:
+        log_path = Path(args.log) if args.log else Path(args.output).with_suffix(".log")
 
-    cv2.imwrite(args.output, result)
-    print(f"Saved: {args.output}")
+    scan_speed = args.speed
+    fps_override = args.fps
+    axis = args.axis
+    params = {}
+    if not args.ignore_sidecar:
+        params = sidecar.scan_parameters(args.video)
 
-    if args.save_shifts:
-        shifts_path = Path(args.output).with_suffix(".shifts.npy")
-        np.save(shifts_path, np.array(shifts))
-        print(f"Saved shifts: {shifts_path}")
+    with file_log(log_path, header="=== taper-reconstruct ===") as active_log:
+        log_environment(log, {"command": " ".join(sys.argv)})
+
+        if params:
+            log.info("Recording metadata found (%s)", params.get("source"))
+            if scan_speed is None and "scan_speed" in params:
+                scan_speed = params["scan_speed"]
+                log.info("Using scan speed %.3f um/s from the recording", scan_speed)
+            if fps_override is None and "fps" in params:
+                fps_override = params["fps"]
+            if axis is None and "axis" in params:
+                axis = params["axis"]
+                log.info("Using scan axis %d from the recording", axis)
+
+        if axis is None:
+            axis = 1
+
+        try:
+            result, shifts = reconstruct_taper(
+                video_path=args.video,
+                mode=args.mode,
+                scan_speed=scan_speed,
+                pixel_scale=args.pixel_scale,
+                axis=axis,
+                roi=tuple(args.roi) if args.roi else None,
+                skip=args.skip,
+                blend=not args.no_blend,
+                tolerance=args.tolerance,
+                fps_override=fps_override,
+            )
+
+            if args.compress is not None and args.compress > 1:
+                result = compress_along_axis(result, args.compress, axis)
+                log.info(
+                    "Compressed %.1fx along scan axis -> %d x %d px",
+                    args.compress,
+                    result.shape[1],
+                    result.shape[0],
+                )
+
+            if not cv2.imwrite(args.output, result):
+                raise OSError(f"Could not write output image: {args.output}")
+            log.info("Saved: %s", args.output)
+
+            if args.save_shifts:
+                shifts_path = Path(args.output).with_suffix(".shifts.npy")
+                np.save(shifts_path, np.array(shifts))
+                log.info("Saved shifts: %s", shifts_path)
+
+        except Exception:
+            log.error("Reconstruction failed:\n%s", traceback.format_exc())
+            log.error("Application log: %s", app_log_path())
+            if active_log:
+                log.error("Run log: %s", active_log)
+            sys.exit(1)
+
+        if active_log:
+            log.info("Log written to %s", active_log)
 
 
 if __name__ == "__main__":
