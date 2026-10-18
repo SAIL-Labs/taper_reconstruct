@@ -4,7 +4,7 @@ Record and reconstruct photonic lantern taper images from diameter scan videos.
 
 ## Components
 
-- **Taper Recorder** — System tray app that records a selected screen region to MP4 during taper diameter scans, with integrated one-click reconstruction. Each recording is tagged with its scan speed, outlined on screen while it runs, and logged.
+- **Taper Recorder** — System tray app that records screen regions to MP4: a diameter scan for reconstruction (tagged with its scan speed) or the taper being drawn (a plain video), each from its own region, outlined on screen while it runs, and logged. Includes one-click reconstruction.
 - **Taper Reconstruct** — CLI tool that stitches video frames into a single composite image of the taper using phase correlation alignment and linear blending.
 
 ## Installation
@@ -41,14 +41,58 @@ taper-recorder
 ```
 
 1. A system tray icon (blue "T") appears in the taskbar
-2. Right-click → **Select Region...** to draw a capture area
-3. Right-click → **Show Region Overlay** to confirm the region is on the right spot
-4. Right-click → **Start Recording...** — asks for the scan speed, an optional
-   sample label, and the output folder
-5. Right-click → **Stop Recording** when the scan is complete
-6. Right-click → **Reconstruct Last Recording...** to generate the composite image
+2. Right-click → **Select Scan Region...** to draw the capture area for
+   diameter scans; **Select Process Region...** for the view of the taper
+   being drawn (the two are independent and remembered separately)
+3. Right-click → **Show Region Overlays** to confirm both are on the right
+   spot (scan in cyan, process in amber)
+4. Right-click → **Start Scan Recording...** — asks for the scan speed, scan
+   axis, an optional sample label and notes, and the output folder — or
+   **Start Process Recording...**, which asks only for a label, notes and
+   frame rate
+5. Right-click → **Stop … Recording** when done
+6. Right-click → **Reconstruct Last Scan...** — shows the scan speed, axis
+   and frame rate it is about to use, and where each came from, then builds
+   the composite image
 
-Settings (scan speed, frame rate, compression, etc.) are available via the tray menu and persist between sessions.
+#### Two kinds of recording
+
+| | Scan | Process |
+|---|---|---|
+| What it captures | The diameter scan sweeping along the taper | The taper being drawn, as it happens |
+| Region | Scan region | Process region |
+| Asks for | Scan speed, axis, label, notes | Label, notes |
+| Default frame rate | 15 fps | 5 fps (a draw runs for minutes) |
+| File name | `taper_scan_<time>_<speed>umps[_label].mp4` | `taper_process_<time>[_label].mp4` |
+| Afterwards | Reconstructed into one image | Kept as a video |
+
+Only one recording runs at a time. Both write a `.meta.json` sidecar and a
+capture log; a process sidecar carries `"kind": "process"`, and if such a
+video is ever sent to **Reconstruct from File...** the confirmation dialog
+says so in red.
+
+#### Filing a recording whose folder doesn't exist yet
+
+A device usually gets its data folder only once the taper is finished, which
+is after its process recording has to start. So the setup dialog has a
+checkbox, **Choose the folder when the recording finishes** — on by default
+for process recordings, off for scans, remembered per mode. A deferred
+recording is written to `<output folder>/unfiled/`, and when it stops a
+prompt asks where it goes: **Choose Folder...** opens a picker (create the
+device folder right there) and moves the video with its sidecar and logs;
+**Later** leaves it in `unfiled/`.
+
+Anything left behind is filed from **File Held Recordings...** in the tray
+menu: tick the recordings that belong together — typically the draw and the
+scan that followed it — and pick one destination. The video and every file
+sharing its name (`.meta.json`, `.log`, `.reconstruct.log`,
+`.reconstructed.png`) always move as a set, nothing is ever overwritten, and
+a video that is still being reconstructed is held back until that finishes.
+The tray mentions how many recordings are waiting when the app starts.
+
+Settings hold the defaults (scan speed, axis, frame rate, compression, etc.)
+and persist between sessions; the recording dialog starts from them and
+updates them with whatever you last used.
 
 #### Scan speed and file naming
 
@@ -65,8 +109,9 @@ Speeds with a fraction use `p` for the decimal point (`12p5umps` = 12.5 µm/s).
 
 #### Capture overlay
 
-While the overlay is on, the captured region is outlined on screen (cyan when
-idle, red while recording) with a status panel showing elapsed time, frame
+While the overlays are on, each configured region is outlined on screen
+(cyan for scan and amber for process when idle, red while recording) with a
+status panel showing elapsed time, frame
 count, measured frame rate, scan speed, and a live thumbnail of what is being
 captured. Both the outline and the panel are drawn *outside* the captured
 region, so neither appears in the recording. If the region fills the screen and
@@ -82,9 +127,22 @@ the panel has nowhere to go, only the outline is drawn.
 | `<name>.reconstruct.log` | Written when that video is reconstructed — inputs, alignment diagnostics, and the traceback if it fails |
 | `<name>.reconstructed.png` | The composite image |
 
-Reconstruction reads `<name>.meta.json` for the scan speed and the frame rate
-actually achieved during capture, so a recording that ran slower than the
-requested rate still gets the right pixel scale.
+These always travel together: filing a held recording moves the whole set.
+
+Reconstruction reads `<name>.meta.json` for the scan speed, scan axis and the
+frame rate actually achieved during capture, so a recording that ran slower
+than the requested rate still gets the right pixel scale.
+
+#### Reconstructing
+
+Choosing **Reconstruct Last Recording...** or **Reconstruct from File...**
+opens a confirmation dialog listing the scan speed, scan axis and frame rate,
+each tagged with its source: the recording's sidecar, the speed in the file
+name, or the video container. A value that had to fall back to a Settings
+default — a video from before this version, or one recorded elsewhere — is
+flagged in red so it gets checked rather than trusted. Edit anything that is
+wrong and press Enter. Automatic reconstruction after a recording skips the
+dialog, since those values were just entered.
 
 #### Logs
 

@@ -267,18 +267,35 @@ def reconstruct_taper(
         )
         fps = float(fps_override)
 
-    if not fps or not np.isfinite(fps) or fps <= 0:
+    # Only 'auto' and 'constant' turn shifts into microns, so only they
+    # need a trustworthy frame rate.
+    if mode in ("auto", "constant") and (
+        not fps or not np.isfinite(fps) or fps <= 0
+    ):
         raise ValueError(
             f"Video reports an unusable frame rate ({fps}). "
             "Pass an explicit frame rate to continue."
         )
-    if n_frames < 2:
+
+    # Some containers do not report a frame count (OpenCV returns 0 or -1).
+    # The frames are still readable; only the progress estimate is lost.
+    if n_frames <= 0:
+        log.warning(
+            "The container does not report a frame count; progress will be "
+            "shown without a total."
+        )
+        n_used = None
+    elif n_frames < 2:
         raise ValueError(
             f"Video has {n_frames} frame(s); at least 2 are needed to stitch a taper."
         )
-
-    n_used = n_frames // skip
-    log.info("Using every %d-th frame -> ~%d frames", skip, n_used)
+    else:
+        n_used = n_frames // skip
+    log.info(
+        "Using every %d-th frame -> %s frames",
+        skip,
+        f"~{n_used}" if n_used else "an unknown number of",
+    )
 
     # Validate mode requirements
     if mode == "constant":
@@ -298,7 +315,7 @@ def reconstruct_taper(
     shifts = []
     prev_frame = None
     frame_gen = extract_frames(video_path, roi=roi, skip=skip)
-    report_every = max(1, n_used // 10)
+    report_every = max(1, n_used // 10) if n_used else 100
 
     for i, frame in enumerate(_progress(frame_gen, n_used, "Shifts")):
         if prev_frame is not None:
@@ -310,7 +327,7 @@ def reconstruct_taper(
                 shifts.append(s)
         prev_frame = frame
         if i and i % report_every == 0:
-            log.debug("  shifts: frame %d/%d", i, n_used)
+            log.debug("  shifts: frame %d/%s", i, n_used or "?")
 
     if not shifts:
         raise ValueError(
@@ -467,7 +484,7 @@ def reconstruct_taper(
                 result[y0:y1, :] += frame.astype(np.float64) * mask
                 weight[y0:y1, :] += mask
         if i and i % report_every == 0:
-            log.debug("  composite: frame %d/%d", i, n_used)
+            log.debug("  composite: frame %d/%s", i, n_used or "?")
 
     # Normalise
     n_empty = int(np.count_nonzero(weight == 0))
@@ -616,7 +633,10 @@ def main():
         log_environment(log, {"command": " ".join(sys.argv)})
 
         if params:
-            log.info("Recording metadata found (%s)", params.get("source"))
+            log.info(
+                "Recording metadata found (scan speed from %s)",
+                params.get("source", "nowhere — none recorded"),
+            )
             if scan_speed is None and "scan_speed" in params:
                 scan_speed = params["scan_speed"]
                 log.info("Using scan speed %.3f um/s from the recording", scan_speed)
