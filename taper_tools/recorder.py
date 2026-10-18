@@ -148,6 +148,7 @@ class RegionSelector(QWidget):
     """Full-screen transparent overlay for rubber-band region selection."""
 
     region_selected = pyqtSignal(QRect)
+    closed = pyqtSignal()
 
     def __init__(self, initial_rect=None):
         super().__init__()
@@ -230,6 +231,10 @@ class RegionSelector(QWidget):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
             self.close()
+
+    def closeEvent(self, event):
+        self.closed.emit()
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +809,7 @@ class RecordingSetupDialog(QDialog):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         self.settings = dict(settings)
         self.region = region
+        self._timestamp = None  # fixed when the user presses Start
         self._build_ui()
         self.setMinimumWidth(460)
 
@@ -910,8 +916,14 @@ class RecordingSetupDialog(QDialog):
         self.name_label.setText(self.filename())
 
     def filename(self):
+        """File name for the recording.
+
+        While the dialog is open this previews the name as it would be
+        right now; after Start is pressed the timestamp is fixed, so the
+        name written to disk is the one the recording actually began with.
+        """
         return sidecar.build_video_filename(
-            self.speed_spin.value(), self.label_edit.text()
+            self.speed_spin.value(), self.label_edit.text(), self._timestamp
         )
 
     def accept(self):
@@ -926,6 +938,7 @@ class RecordingSetupDialog(QDialog):
                 self, "Output folder", f"Cannot use {directory}:\n{exc}"
             )
             return
+        self._timestamp = datetime.now()
         super().accept()
 
     def values(self):
@@ -1237,12 +1250,19 @@ class TaperRecorderApp(QObject):
     # --- Region selection ---
     def select_region(self):
         initial = self._region_rect()
+        # The overlay would sit on top of the selector, so hide it for the
+        # duration and put it back if the selection is cancelled.
         was_previewing = self.overlay_action.isChecked()
         if was_previewing:
             self.overlay_action.setChecked(False)
 
+        def _restore_overlay():
+            if was_previewing and not self.overlay_action.isChecked():
+                self.overlay_action.setChecked(True)
+
         self.region_selector = RegionSelector(initial)
         self.region_selector.region_selected.connect(self._on_region_selected)
+        self.region_selector.closed.connect(_restore_overlay)
         self.region_selector.show()
         self.region_selector.raise_()
         self.region_selector.activateWindow()
@@ -1270,6 +1290,13 @@ class TaperRecorderApp(QObject):
     # --- Overlay ---
     def _toggle_idle_overlay(self, checked):
         if self.recording:
+            # Mid-scan the overlay is the recording one; let it be shown or
+            # dismissed, but leave the idle preview grabber alone.
+            if checked:
+                self.overlay.show(self._region_rect(), recording=True, show_panel=True)
+                self._update_recording_status()
+            else:
+                self.overlay.hide()
             return
         if checked:
             region = self._region_rect()
@@ -1415,6 +1442,10 @@ class TaperRecorderApp(QObject):
             )
         else:
             self.overlay.hide()
+        # Keep the menu's check mark truthful without re-triggering the slot
+        self.overlay_action.blockSignals(True)
+        self.overlay_action.setChecked(bool(values["show_overlay"]))
+        self.overlay_action.blockSignals(False)
         self._update_status_timer.start(500)
         self._update_recording_status()
 
@@ -1539,7 +1570,7 @@ class TaperRecorderApp(QObject):
         axis = params.get("axis", s["axis"])
         fps_override = params.get("fps")
 
-        if not params:
+        if "scan_speed" not in params:
             log.warning(
                 "No metadata sidecar or scan speed in the file name for %s; "
                 "falling back to the settings value of %.1f µm/s",

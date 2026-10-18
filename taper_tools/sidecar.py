@@ -128,7 +128,7 @@ def scan_parameters(video_path):
     -------
     params : dict
         Keys present only when known: ``scan_speed``, ``fps``, ``axis``,
-        ``label``, plus ``source`` describing where they came from.
+        ``label``, plus ``source`` saying where the scan speed came from.
     """
     params = {}
     meta = read_metadata(video_path)
@@ -136,6 +136,7 @@ def scan_parameters(video_path):
         speed = meta.get("scan_speed_um_s")
         if speed:
             params["scan_speed"] = float(speed)
+            params["source"] = str(sidecar_path(video_path))
         fps = meta.get("effective_fps")
         if fps:
             params["fps"] = float(fps)
@@ -143,11 +144,17 @@ def scan_parameters(video_path):
             params["axis"] = int(meta["axis"])
         if meta.get("label"):
             params["label"] = meta["label"]
-        params["source"] = str(sidecar_path(video_path))
-        return params
 
-    speed = parse_speed_from_name(video_path)
-    if speed:
-        params["scan_speed"] = speed
-        params["source"] = "file name"
+    # A sidecar without a speed (hand-edited, older schema) must not hide
+    # the speed written into the file name.
+    if "scan_speed" not in params:
+        speed = parse_speed_from_name(video_path)
+        if speed:
+            params["scan_speed"] = speed
+            params["source"] = "file name"
+        elif meta:
+            log.warning(
+                "%s has no scan speed and the file name does not encode one",
+                sidecar_path(video_path).name,
+            )
     return params
