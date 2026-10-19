@@ -152,8 +152,8 @@ def scan_parameters(video_path):
     -------
     params : dict
         Keys present only when known: ``scan_speed``, ``fps``, ``axis``,
-        ``label``, ``kind``, plus ``source`` saying where the scan speed
-        came from.
+        ``label``, ``kind``, ``pauses`` (count), plus ``source`` saying where
+        the scan speed came from.
     """
     params = {}
     meta = read_metadata(video_path)
@@ -171,6 +171,7 @@ def scan_parameters(video_path):
             params["label"] = meta["label"]
         if meta.get("kind"):
             params["kind"] = meta["kind"]
+        params["pauses"] = len(meta.get("pauses") or [])
 
     # A sidecar without a speed (hand-edited, older schema) must not hide
     # the speed written into the file name.
