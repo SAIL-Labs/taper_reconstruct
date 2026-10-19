@@ -47,10 +47,11 @@ taper-recorder
 3. Right-click → **Show Region Overlays** to confirm both are on the right
    spot (scan in cyan, process in amber)
 4. Right-click → **Start Scan Recording...** — asks for the scan speed, scan
-   axis, an optional sample label and notes, and the output folder — or
-   **Start Process Recording...**, which asks only for a label, notes and
-   frame rate
-5. Right-click → **Stop … Recording** when done
+   axis, an optional sample label and notes, a time limit, and the output
+   folder — or **Start Process Recording...**, which asks only for a label,
+   notes, frame rate and time limit
+5. **Stop** (or **Pause**) from the buttons beside the overlay, or
+   right-click → **Stop … Recording** / **Pause Recording**
 6. Right-click → **Reconstruct Last Scan...** — shows the scan speed, axis
    and frame rate it is about to use, and where each came from, then builds
    the composite image
@@ -110,12 +111,32 @@ Speeds with a fraction use `p` for the decimal point (`12p5umps` = 12.5 µm/s).
 #### Capture overlay
 
 While the overlays are on, each configured region is outlined on screen
-(cyan for scan and amber for process when idle, red while recording) with a
-status panel showing elapsed time, frame
-count, measured frame rate, scan speed, and a live thumbnail of what is being
-captured. Both the outline and the panel are drawn *outside* the captured
-region, so neither appears in the recording. If the region fills the screen and
-the panel has nowhere to go, only the outline is drawn.
+(cyan for scan and amber for process when idle, red while recording, yellow
+while paused) with a status panel showing elapsed time, frame count, measured
+frame rate, scan speed, when the time limit will stop it, and a live thumbnail
+of what is being captured. During a recording a strip with **Pause**/**Resume**
+and **Stop** buttons sits beside the panel. Everything is drawn *outside* the
+captured region, so none of it appears in the recording. If the region fills
+the screen and the panel has nowhere to go, only the outline is drawn.
+
+The recording overlay comes down with the recording. Whether the idle outlines
+stay up afterwards is the **Keep the region overlays on screen after the
+recording** setting (off by default), in both Settings and the setup dialog.
+
+#### Pausing and the time limit
+
+Pause stops frames being written; the file stays open and the elapsed clock
+freezes, so the measured frame rate and the sidecar's frame timestamps are
+unaffected. Each pause is recorded in the sidecar. Pausing a *scan* is allowed
+but flagged, since frames either side of the gap will not line up: the capture
+log says so, and the reconstruction dialog warns in red.
+
+Every recording has a time limit — **Stop after** in the setup dialog, 5 min by
+default for both modes, remembered per mode, 0 for none — as a safety net for
+one left running. Paused time does not count. The overlay shows "stops at
+MM:SS", switching to a countdown in the last minute, and when it fires the
+recording ends exactly as Stop would, with the usual filing prompt if the
+folder was deferred.
 
 #### Files written per recording
 

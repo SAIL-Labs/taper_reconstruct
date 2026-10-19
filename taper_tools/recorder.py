@@ -125,6 +125,12 @@ DEFAULT_SETTINGS = {
     # so this is the default for process recordings.
     "scan_defer_folder": False,
     "process_defer_folder": True,
+    # Leave the idle overlays up once a recording ends (the recording
+    # overlay itself is controlled per recording in the setup dialog).
+    "overlay_after_record": False,
+    # Safety net for a recording left running, in minutes (0 = no limit).
+    "scan_max_minutes": 5,
+    "process_max_minutes": 5,
 }
 
 SETTINGS_PATH = Path.home() / ".taper_recorder.json"
@@ -258,6 +264,7 @@ OVERLAY_MARGIN = OVERLAY_GAP + OVERLAY_BORDER
 PANEL_GAP = 8  # gap between the outline and the status panel
 
 RECORDING_COLOUR = QColor(235, 60, 60)
+PAUSED_COLOUR = QColor(255, 190, 40)
 PREVIEW_COLOUR = QColor(0, 180, 255)
 PROCESS_COLOUR = QColor(255, 170, 0)
 
@@ -270,6 +277,7 @@ MODES = {
         "region_key": "region",
         "fps_key": "fps",
         "defer_key": "scan_defer_folder",
+        "max_key": "scan_max_minutes",
         "idle_colour": PREVIEW_COLOUR,
     },
     sidecar.KIND_PROCESS: {
@@ -277,6 +285,7 @@ MODES = {
         "region_key": "process_region",
         "fps_key": "process_fps",
         "defer_key": "process_defer_folder",
+        "max_key": "process_max_minutes",
         "idle_colour": PROCESS_COLOUR,
     },
 }
@@ -285,8 +294,8 @@ THUMB_MAX_W = 260
 THUMB_MAX_H = 200
 
 
-class ClickThroughWindow(QWidget):
-    """Frameless, always-on-top window that ignores mouse input."""
+class FloatingWindow(QWidget):
+    """Frameless, always-on-top, translucent window that never takes focus."""
 
     def __init__(self):
         super().__init__(None)
@@ -294,12 +303,130 @@ class ClickThroughWindow(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
-            | Qt.WindowType.WindowTransparentForInput
             | Qt.WindowType.WindowDoesNotAcceptFocus
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+
+class ClickThroughWindow(FloatingWindow):
+    """A FloatingWindow that also ignores mouse input."""
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlag(Qt.WindowType.WindowTransparentForInput, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+
+class ControlStrip(FloatingWindow):
+    """Pause/Resume and Stop buttons shown beside the status panel.
+
+    Unlike the outline and panel this one takes clicks, so it is placed
+    clear of the captured region like everything else.
+    """
+
+    pause_clicked = pyqtSignal()
+    stop_clicked = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
+        self.pause_btn = QPushButton("Pause")
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.setObjectName("stop")
+        for button in (self.pause_btn, self.stop_btn):
+            button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            layout.addWidget(button)
+        self.setStyleSheet(
+            "QPushButton { background: #333; color: white; border: 1px solid #777;"
+            " border-radius: 4px; padding: 4px 14px; font-weight: bold; }"
+            "QPushButton:hover { background: #555; }"
+            "QPushButton#stop { border-color: #e03c3c; }"
+            "QPushButton#stop:hover { background: #7a2020; }"
+        )
+        self.pause_btn.clicked.connect(self.pause_clicked)
+        self.stop_btn.clicked.connect(self.stop_clicked)
+        self.adjustSize()
+
+    def set_paused(self, paused):
+        self.pause_btn.setText("Resume" if paused else "Pause")
+        self.adjustSize()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(QColor(0, 0, 0, 200))
+        painter.setPen(QPen(QColor(120, 120, 120), 1))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 6, 6)
+
+
+def _screen_rect_for(region):
+    screen = QApplication.screenAt(region.center()) or QApplication.primaryScreen()
+    return screen.geometry()
+
+
+def _outline_rect(region):
+    return region.adjusted(
+        -OVERLAY_MARGIN, -OVERLAY_MARGIN, OVERLAY_MARGIN, OVERLAY_MARGIN
+    )
+
+
+def _first_clear(candidates, size, region, avoid):
+    """First candidate that is on screen and clear of the region and `avoid`."""
+    available = _screen_rect_for(region)
+    outline = _outline_rect(region)
+    for point in candidates:
+        rect = QRect(point, size)
+        if not available.contains(rect) or rect.intersects(outline):
+            continue
+        if any(rect.intersects(other) for other in avoid):
+            continue
+        return point
+    return None
+
+
+def find_clear_spot(size, region, avoid=()):
+    """A place for a window of `size` outside `region`, or None if none fits."""
+    available = _screen_rect_for(region)
+    offset = OVERLAY_MARGIN + PANEL_GAP
+    candidates = [
+        QPoint(region.left(), region.bottom() + offset),
+        QPoint(region.left(), region.top() - offset - size.height()),
+        QPoint(region.right() + offset, region.top()),
+        QPoint(region.left() - offset - size.width(), region.top()),
+        QPoint(available.left() + PANEL_GAP, available.top() + PANEL_GAP),
+        QPoint(
+            available.right() - PANEL_GAP - size.width(),
+            available.top() + PANEL_GAP,
+        ),
+        QPoint(
+            available.left() + PANEL_GAP,
+            available.bottom() - PANEL_GAP - size.height(),
+        ),
+        QPoint(
+            available.right() - PANEL_GAP - size.width(),
+            available.bottom() - PANEL_GAP - size.height(),
+        ),
+    ]
+    return _first_clear(candidates, size, region, avoid)
+
+
+def find_spot_beside(anchor, size, region, avoid=()):
+    """A place next to `anchor` (below, above, right, left), else anywhere clear."""
+    gap = PANEL_GAP
+    candidates = [
+        QPoint(anchor.left(), anchor.bottom() + 1 + gap),
+        QPoint(anchor.left(), anchor.top() - gap - size.height()),
+        QPoint(anchor.right() + 1 + gap, anchor.top()),
+        QPoint(anchor.left() - gap - size.width(), anchor.top()),
+    ]
+    avoid = (anchor,) + tuple(avoid)
+    return _first_clear(candidates, size, region, avoid) or find_clear_spot(
+        size, region, avoid
+    )
 
 
 class RegionOutline(ClickThroughWindow):
@@ -382,39 +509,11 @@ class StatusPanel(ClickThroughWindow):
         """Position the panel outside ``region``.  False if it does not fit."""
         size = self.content_size()
         self.resize(size)
-
-        screen = QApplication.screenAt(region.center()) or QApplication.primaryScreen()
-        available = screen.geometry()
-        outline = region.adjusted(
-            -OVERLAY_MARGIN, -OVERLAY_MARGIN, OVERLAY_MARGIN, OVERLAY_MARGIN
-        )
-        offset = OVERLAY_MARGIN + PANEL_GAP
-
-        candidates = [
-            QPoint(region.left(), region.bottom() + offset),
-            QPoint(region.left(), region.top() - offset - size.height()),
-            QPoint(region.right() + offset, region.top()),
-            QPoint(region.left() - offset - size.width(), region.top()),
-            QPoint(available.left() + PANEL_GAP, available.top() + PANEL_GAP),
-            QPoint(
-                available.right() - PANEL_GAP - size.width(),
-                available.top() + PANEL_GAP,
-            ),
-            QPoint(
-                available.left() + PANEL_GAP,
-                available.bottom() - PANEL_GAP - size.height(),
-            ),
-            QPoint(
-                available.right() - PANEL_GAP - size.width(),
-                available.bottom() - PANEL_GAP - size.height(),
-            ),
-        ]
-        for point in candidates:
-            rect = QRect(point, size)
-            if available.contains(rect) and not rect.intersects(outline):
-                self.move(point)
-                return True
-        return False
+        point = find_clear_spot(size, region)
+        if point is None:
+            return False
+        self.move(point)
+        return True
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -463,16 +562,28 @@ class StatusPanel(ClickThroughWindow):
 
 
 class CaptureOverlay(QObject):
-    """Outline + status panel shown over the captured region."""
+    """Outline + status panel shown over the captured region.
+
+    While recording, a strip with Pause/Resume and Stop buttons sits
+    beside the panel.
+    """
+
+    pause_clicked = pyqtSignal()
+    stop_clicked = pyqtSignal()
 
     def __init__(self, parent=None, idle_colour=PREVIEW_COLOUR):
         super().__init__(parent)
         self._outline = RegionOutline()
         self._panel = StatusPanel()
+        self._controls = ControlStrip()
+        self._controls.pause_clicked.connect(self.pause_clicked)
+        self._controls.stop_clicked.connect(self.stop_clicked)
         self._region = None
         self._show_panel = True
         self._panel_fits = True
         self._idle_colour = idle_colour
+        self._recording = False
+        self._paused = False
 
     @staticmethod
     def _to_pixmap(frame):
@@ -494,10 +605,18 @@ class CaptureOverlay(QObject):
         ).copy()
         return QPixmap.fromImage(image)
 
+    def _colour(self):
+        if not self._recording:
+            return self._idle_colour
+        return PAUSED_COLOUR if self._paused else RECORDING_COLOUR
+
     def show(self, region, recording=False, show_panel=True):
         self._region = QRect(region)
         self._show_panel = show_panel
-        colour = RECORDING_COLOUR if recording else self._idle_colour
+        self._recording = recording
+        if not recording:
+            self._paused = False
+        colour = self._colour()
 
         self._outline.set_colour(colour)
         self._outline.set_region(self._region)
@@ -519,22 +638,62 @@ class CaptureOverlay(QObject):
         else:
             self._panel.hide()
 
-    def update_status(self, title, lines, frame=None):
-        if not self._show_panel or self._region is None:
-            return
-        self._panel.set_content(title, lines)
-        self._panel.set_thumbnail(self._to_pixmap(frame))
-        self._panel_fits = self._panel.place(self._region)
-        if self._panel_fits:
-            if not self._panel.isVisible():
-                self._panel.show()
-            self._panel.update()
-            self._panel.raise_()
+        if recording:
+            self._place_controls()
         else:
-            self._panel.hide()
+            self._controls.hide()
+
+    def _place_controls(self):
+        """Put the buttons beside the panel (or the outline if no panel)."""
+        if self._region is None:
+            return
+        if self._show_panel and self._panel_fits:
+            anchor = self._panel.geometry()
+        else:
+            anchor = _outline_rect(self._region)
+        self._controls.adjustSize()
+        point = find_spot_beside(anchor, self._controls.size(), self._region)
+        if point is None:
+            log.warning("No room on screen for the overlay controls.")
+            self._controls.hide()
+            return
+        self._controls.move(point)
+        if not self._controls.isVisible():
+            self._controls.show()
+        self._controls.raise_()
+
+    def update_status(self, title, lines, frame=None):
+        if self._region is None:
+            return
+        if self._show_panel:
+            self._panel.set_content(title, lines)
+            self._panel.set_thumbnail(self._to_pixmap(frame))
+            self._panel_fits = self._panel.place(self._region)
+            if self._panel_fits:
+                if not self._panel.isVisible():
+                    self._panel.show()
+                self._panel.update()
+                self._panel.raise_()
+            else:
+                self._panel.hide()
+        if self._recording:
+            self._place_controls()
+
+    def set_paused(self, paused):
+        if paused == self._paused:
+            return
+        self._paused = paused
+        colour = self._colour()
+        self._outline.set_colour(colour)
+        self._panel.set_colour(colour)
+        self._panel.update()
+        self._controls.set_paused(paused)
+        if self._recording:
+            self._place_controls()
 
     def set_recording(self, recording):
-        colour = RECORDING_COLOUR if recording else self._idle_colour
+        self._recording = recording
+        colour = self._colour()
         self._outline.set_colour(colour)
         self._panel.set_colour(colour)
         self._panel.update()
@@ -542,10 +701,17 @@ class CaptureOverlay(QObject):
     def hide(self):
         self._outline.hide()
         self._panel.hide()
+        self._controls.hide()
+        self._recording = False
+        self._paused = False
 
     @property
     def visible(self):
         return self._outline.isVisible()
+
+    @property
+    def controls_visible(self):
+        return self._controls.isVisible()
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +728,7 @@ class ScreenRecorder:
 
     PREVIEW_INTERVAL = 0.2  # seconds between preview frame updates
     PROGRESS_INTERVAL = 10.0  # seconds between log progress lines
+    PAUSE_POLL = 0.05  # how often a paused loop checks for resume/stop
 
     def __init__(
         self,
@@ -571,6 +738,7 @@ class ScreenRecorder:
         metadata=None,
         log_path=None,
         capture_preview=True,
+        max_seconds=None,
     ):
         """
         Parameters
@@ -588,6 +756,9 @@ class ScreenRecorder:
             Per-recording log file. Defaults to ``<video>.log``.
         capture_preview : bool
             Keep the most recent frame available for the overlay preview.
+        max_seconds : float, optional
+            Stop on its own after this much recording time (pauses
+            excluded).  None records until stopped.
         """
         self.region = region
         self.output_path = output_path
@@ -599,7 +770,11 @@ class ScreenRecorder:
             else sidecar.recording_log_path(output_path)
         )
         self.capture_preview = capture_preview
+        self.max_seconds = float(max_seconds) if max_seconds else None
         self.running = False
+        self.paused = False
+        self.stopped_by_timeout = False
+        self.pauses = []  # [{"at_s": ..., "duration_s": ...}, ...]
         self.signals = RecorderSignals()
         self._thread = None
         self._frame_count = 0
@@ -607,6 +782,8 @@ class ScreenRecorder:
         self._preview_lock = threading.Lock()
         self._stats = {}
         self._start_perf = None
+        self._paused_total = 0.0
+        self._pause_started = None
 
     def start(self):
         self.running = True
@@ -621,6 +798,14 @@ class ScreenRecorder:
             if self._thread.is_alive():
                 log.error("Capture thread did not stop within 10 s")
 
+    def pause(self):
+        """Stop writing frames until resume(); the file stays open."""
+        if self.running:
+            self.paused = True
+
+    def resume(self):
+        self.paused = False
+
     @property
     def frame_count(self):
         return self._frame_count
@@ -631,9 +816,21 @@ class ScreenRecorder:
 
     @property
     def elapsed(self):
+        """Recording time in seconds, with pauses excluded."""
         if self._start_perf is None:
             return 0.0
-        return time.perf_counter() - self._start_perf
+        now = time.perf_counter()
+        paused = self._paused_total
+        if self.paused and self._pause_started is not None:
+            paused += now - self._pause_started
+        return max(0.0, now - self._start_perf - paused)
+
+    @property
+    def remaining(self):
+        """Seconds left before the time limit, or None without a limit."""
+        if self.max_seconds is None:
+            return None
+        return max(0.0, self.max_seconds - self.elapsed)
 
     def latest_preview(self):
         """Most recent captured frame (BGR), or None."""
@@ -650,6 +847,7 @@ class ScreenRecorder:
                     "video": self.output_path,
                     "region": self.region,
                     "target fps": self.fps,
+                    "time limit": f"{self.max_seconds:.0f} s" if self.max_seconds else "none",
                     **{
                         f"meta:{k}": v
                         for k, v in self.metadata.items()
@@ -704,14 +902,40 @@ class ScreenRecorder:
                 self._start_perf = time.perf_counter()
 
                 while self.running:
+                    if self.paused:
+                        # Hold here, not writing, until resumed or stopped.
+                        # Paused time is kept out of the frame timestamps so
+                        # the measured frame rate stays honest.
+                        self._pause_started = time.perf_counter()
+                        at = self._pause_started - self._start_perf - self._paused_total
+                        log.info("Paused at %.1f s", at)
+                        while self.running and self.paused:
+                            time.sleep(self.PAUSE_POLL)
+                        duration = time.perf_counter() - self._pause_started
+                        self._paused_total += duration
+                        self._pause_started = None
+                        self.pauses.append(
+                            {"at_s": round(at, 3), "duration_s": round(duration, 3)}
+                        )
+                        log.info("Resumed after %.1f s", duration)
+                        continue
+
                     t0 = time.perf_counter()
+                    stamp = t0 - self._start_perf - self._paused_total
+                    if self.max_seconds is not None and stamp >= self.max_seconds:
+                        self.stopped_by_timeout = True
+                        log.warning(
+                            "Reached the %.0f s time limit; stopping automatically",
+                            self.max_seconds,
+                        )
+                        break
+
                     img = sct.grab(self.region)
                     frame = np.array(img)
                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
                     writer.write(frame)
                     self._frame_count += 1
 
-                    stamp = t0 - self._start_perf
                     frame_times.append(stamp)
                     grab = time.perf_counter() - t0
                     grab_times.append(grab)
@@ -780,6 +1004,9 @@ class ScreenRecorder:
             "max_grab_ms": round(float(np.max(grab_times) * 1000), 2)
             if grab_times
             else None,
+            "paused_total_s": round(self._paused_total, 3),
+            "pause_count": len(self.pauses),
+            "stopped_by_time_limit": self.stopped_by_timeout,
         }
         self._stats = stats
 
@@ -790,9 +1017,9 @@ class ScreenRecorder:
 
         log.info("--- capture summary ---")
         for key, value in stats.items():
-            log.info("  %-14s %s", key, value)
+            log.info("  %-20s %s", key, value)
         if size_mb is not None:
-            log.info("  %-14s %.1f MB", "video_size", size_mb)
+            log.info("  %-20s %.1f MB", "video_size", size_mb)
         log.info("-----------------------")
 
         if n_slow and n:
@@ -806,6 +1033,12 @@ class ScreenRecorder:
                     effective_fps,
                     self.fps,
                 )
+        if self.pauses and self.metadata.get("kind") == sidecar.KIND_SCAN:
+            log.warning(
+                "This scan was paused %d time(s); frames either side of a pause "
+                "will not line up in the reconstruction.",
+                len(self.pauses),
+            )
 
         metadata = {
             "tool": "taper-recorder",
@@ -815,6 +1048,8 @@ class ScreenRecorder:
             "capture_region": self.region,
             "frame_size": list(frame_size),
             "log": Path(self.log_path).name if self.log_path else None,
+            "max_seconds": self.max_seconds,
+            "pauses": list(self.pauses),
             **self.metadata,
             **stats,
         }
@@ -919,6 +1154,20 @@ class RecordingSetupDialog(QDialog):
         )
         scan_form.addRow("Notes:", self.notes_edit)
 
+        max_key = self.mode_info["max_key"]
+        self.limit_spin = QSpinBox()
+        self.limit_spin.setRange(0, 600)
+        self.limit_spin.setSuffix(" min")
+        self.limit_spin.setSpecialValueText("no limit")
+        self.limit_spin.setValue(
+            int(self.settings.get(max_key, DEFAULT_SETTINGS[max_key]))
+        )
+        self.limit_spin.setToolTip(
+            "Stops the recording on its own after this long (pauses not "
+            "counted) — a safety net for one left running. 0 means no limit."
+        )
+        scan_form.addRow("Stop after:", self.limit_spin)
+
         layout.addWidget(scan_group)
 
         out_group = QGroupBox("Output")
@@ -967,9 +1216,16 @@ class RecordingSetupDialog(QDialog):
             bool(self.settings.get("overlay_preview", True))
         )
         overlay_form.addWidget(self.overlay_preview_cb)
+        self.overlay_after_cb = QCheckBox(
+            "Keep the region overlays on screen after the recording"
+        )
+        self.overlay_after_cb.setChecked(
+            bool(self.settings.get("overlay_after_record", False))
+        )
+        overlay_form.addWidget(self.overlay_after_cb)
         note = QLabel(
             "The overlay is drawn outside the captured region, so it does not "
-            "appear in the recording."
+            "appear in the recording. Pause and Stop buttons sit beside it."
         )
         note.setWordWrap(True)
         note.setStyleSheet("color: gray;")
@@ -1062,7 +1318,9 @@ class RecordingSetupDialog(QDialog):
             "notes": self.notes_edit.text().strip(),
             "show_overlay": self.overlay_cb.isChecked(),
             "overlay_preview": self.overlay_preview_cb.isChecked(),
+            "overlay_after_record": self.overlay_after_cb.isChecked(),
             self.mode_info["defer_key"]: self.defer_folder,
+            self.mode_info["max_key"]: self.limit_spin.value(),
         }
         if self.is_scan:
             values["scan_speed"] = self.speed_spin.value()
@@ -1293,6 +1551,15 @@ class ReconstructionDialog(QDialog):
                     warn=True,
                 )
             )
+        if d.get("pause_warn"):
+            layout.addWidget(
+                self._source_label(
+                    f"This recording was paused {d['pauses']} time(s). Frames "
+                    "either side of a pause will not line up; expect a jump in "
+                    "the composite there.",
+                    warn=True,
+                )
+            )
 
         form = QFormLayout()
 
@@ -1398,6 +1665,32 @@ class SettingsDialog(QDialog):
         self.overlay_preview_cb.setChecked(self.settings.get("overlay_preview", True))
         rec_form.addRow(self.overlay_preview_cb)
 
+        self.overlay_after_cb = QCheckBox(
+            "Keep the region overlays on screen after a recording"
+        )
+        self.overlay_after_cb.setChecked(
+            bool(self.settings.get("overlay_after_record", False))
+        )
+        rec_form.addRow(self.overlay_after_cb)
+
+        self.scan_limit_spin = QSpinBox()
+        self.scan_limit_spin.setRange(0, 600)
+        self.scan_limit_spin.setSuffix(" min")
+        self.scan_limit_spin.setSpecialValueText("no limit")
+        self.scan_limit_spin.setValue(
+            int(self.settings.get("scan_max_minutes", DEFAULT_SETTINGS["scan_max_minutes"]))
+        )
+        rec_form.addRow("Scan time limit:", self.scan_limit_spin)
+
+        self.process_limit_spin = QSpinBox()
+        self.process_limit_spin.setRange(0, 600)
+        self.process_limit_spin.setSuffix(" min")
+        self.process_limit_spin.setSpecialValueText("no limit")
+        self.process_limit_spin.setValue(
+            int(self.settings.get("process_max_minutes", DEFAULT_SETTINGS["process_max_minutes"]))
+        )
+        rec_form.addRow("Process time limit:", self.process_limit_spin)
+
         layout.addWidget(rec_group)
 
         # Reconstruction settings
@@ -1479,6 +1772,9 @@ class SettingsDialog(QDialog):
             "auto_reconstruct": self.auto_recon_cb.isChecked(),
             "show_overlay": self.overlay_cb.isChecked(),
             "overlay_preview": self.overlay_preview_cb.isChecked(),
+            "overlay_after_record": self.overlay_after_cb.isChecked(),
+            "scan_max_minutes": self.scan_limit_spin.value(),
+            "process_max_minutes": self.process_limit_spin.value(),
         }
 
 
@@ -1515,6 +1811,9 @@ class TaperRecorderApp(QObject):
             mode: CaptureOverlay(self, idle_colour=info["idle_colour"])
             for mode, info in MODES.items()
         }
+        for overlay in self.overlays.values():
+            overlay.pause_clicked.connect(self.toggle_pause)
+            overlay.stop_clicked.connect(self._stop_recording)
 
         self._setup_tray()
         self._update_status_timer = QTimer(self)
@@ -1598,6 +1897,11 @@ class TaperRecorderApp(QObject):
             action.triggered.connect(lambda _=False, m=mode: self.toggle_recording(m))
             menu.addAction(action)
             self.record_actions[mode] = action
+
+        self.pause_action = QAction("Pause Recording", self)
+        self.pause_action.triggered.connect(self.toggle_pause)
+        self.pause_action.setVisible(False)
+        menu.addAction(self.pause_action)
 
         self.status_action = QAction("", self)
         self.status_action.setEnabled(False)
@@ -1902,12 +2206,18 @@ class TaperRecorderApp(QObject):
         else:
             log.info("Starting process recording: %s (%d fps)", video_path, fps)
 
+        max_minutes = int(values[info["max_key"]])
+        max_seconds = max_minutes * 60 if max_minutes > 0 else None
+        if max_seconds:
+            log.info("Time limit: %d min", max_minutes)
+
         self.recorder = ScreenRecorder(
             region=region_dict,
             output_path=video_path,
             fps=fps,
             metadata=metadata,
             capture_preview=bool(values["overlay_preview"]),
+            max_seconds=max_seconds,
         )
         self.recorder.signals.finished.connect(
             lambda path, m=mode: self._on_recording_finished(m, path)
@@ -1925,6 +2235,8 @@ class TaperRecorderApp(QObject):
                 action.setText(f"Stop {info['title']} Recording")
             else:
                 action.setEnabled(False)
+        self.pause_action.setText("Pause Recording")
+        self.pause_action.setVisible(True)
         for action in self.select_actions.values():
             action.setEnabled(False)
         self.tray.setIcon(self._create_icon(recording=True))
@@ -1962,6 +2274,8 @@ class TaperRecorderApp(QObject):
     def _reset_recording_ui(self):
         self.recording = False
         self.recording_mode = None
+        self.pause_action.setVisible(False)
+        self.pause_action.setText("Pause Recording")
         for mode, action in self.record_actions.items():
             action.setText(f"Start {MODES[mode]['title']} Recording...")
             action.setEnabled(True)
@@ -1972,52 +2286,106 @@ class TaperRecorderApp(QObject):
         self._update_status_timer.stop()
         self.status_action.setVisible(False)
 
+    def toggle_pause(self):
+        if not self.recording or not self.recorder:
+            return
+        overlay = self.overlays[self.recording_mode]
+        title = MODES[self.recording_mode]["title"]
+        if self.recorder.paused:
+            self.recorder.resume()
+            log.info("Recording resumed")
+            self.pause_action.setText("Pause Recording")
+            overlay.set_paused(False)
+            self.tray.setToolTip(f"Taper Scan Recorder — RECORDING {title.upper()}")
+        else:
+            self.recorder.pause()
+            log.info("Recording paused")
+            if self.recording_mode == sidecar.KIND_SCAN:
+                log.warning(
+                    "Pausing a scan: frames either side of the gap will not "
+                    "line up when reconstructed"
+                )
+            self.pause_action.setText("Resume Recording")
+            overlay.set_paused(True)
+            self.tray.setToolTip(f"Taper Scan Recorder — PAUSED {title.upper()}")
+        self._update_recording_status()
+
     def _stop_recording(self):
         log.info("Stopping recording")
         if self.recorder:
             self.recorder.stop()
         self._reset_recording_ui()
 
-        # Back to the idle overlays if they were left switched on
-        if self.overlay_action.isChecked():
-            self._toggle_idle_overlay(True)
+        # The recording overlay comes down with the recording.  Whether the
+        # idle overlays stay up afterwards is the overlay_after_record setting.
+        if self.settings.get("overlay_after_record", False):
+            if self.overlay_action.isChecked():
+                self._toggle_idle_overlay(True)
+            else:
+                self.overlay_action.setChecked(True)
         else:
+            self.overlay_action.blockSignals(True)
+            self.overlay_action.setChecked(False)
+            self.overlay_action.blockSignals(False)
             self._hide_overlays()
 
     def _update_recording_status(self):
         if not self.recorder or self.recording_mode is None:
             return
-        elapsed = time.time() - self._record_start_time
+        elapsed = self.recorder.elapsed  # pauses excluded
         mins, secs = divmod(int(elapsed), 60)
         n = self.recorder.frame_count
         rate = n / elapsed if elapsed > 0 else 0.0
-        self.status_action.setText(f"  {mins:02d}:{secs:02d}  |  {n} frames")
+        paused = self.recorder.paused
+        state = "PAUSED" if paused else "REC"
+        self.status_action.setText(
+            f"  {state}  {mins:02d}:{secs:02d}  |  {n} frames"
+        )
+
+        limit_line = ""
+        remaining = self.recorder.remaining
+        if remaining is not None:
+            if remaining < 60:
+                limit_line = f"stops in {int(remaining)} s"
+            else:
+                lim_m, lim_s = divmod(int(self.recorder.max_seconds), 60)
+                limit_line = f"stops at {lim_m:02d}:{lim_s:02d}"
 
         overlay = self.overlays[self.recording_mode]
         if overlay.visible:
+            overlay.set_paused(paused)
             lines = [
                 f"{n} frames · {rate:.1f} fps",
                 f"{self.current_scan_speed:g} µm/s"
                 if self.current_scan_speed
                 else "",
+                limit_line,
                 Path(self.current_video_path).name
                 if self.current_video_path
                 else "",
             ]
             overlay.update_status(
-                f"REC {MODES[self.recording_mode]['title'].upper()}  {mins:02d}:{secs:02d}",
+                f"{state} {MODES[self.recording_mode]['title'].upper()}  {mins:02d}:{secs:02d}",
                 [line for line in lines if line],
                 self.recorder.latest_preview(),
             )
 
     def _on_recording_finished(self, mode, path):
         stats = self.recorder.stats if self.recorder else {}
+        timed_out = bool(stats.get("stopped_by_time_limit"))
+        if self.recording:
+            # Ended on its own (time limit); bring the UI down as Stop would.
+            self._stop_recording()
         n = stats.get("frame_count", self.recorder.frame_count if self.recorder else 0)
         effective = stats.get("effective_fps")
         log.info("%s recording finished: %s (%s frames)", MODES[mode]["title"], path, n)
         detail = f"{n} frames saved to {Path(path).name}"
         if effective:
             detail += f"\nMeasured {effective:.2f} fps"
+        if timed_out:
+            detail = "Stopped automatically at the time limit.\n" + detail
+        if stats.get("pause_count"):
+            detail += f"\nPaused {stats['pause_count']} time(s)"
         self.tray.showMessage(
             f"{MODES[mode]['title']} Recording Complete",
             detail,
@@ -2172,7 +2540,9 @@ class TaperRecorderApp(QObject):
             "container_fps": container_fps,
             "kind": params.get("kind"),
             "kind_warn": params.get("kind") == sidecar.KIND_PROCESS,
+            "pauses": int(params.get("pauses", 0) or 0),
         }
+        d["pause_warn"] = d["pauses"] > 0
 
         if "scan_speed" in params:
             d["scan_speed"] = params["scan_speed"]
@@ -2234,6 +2604,13 @@ class TaperRecorderApp(QObject):
         s = dict(self.settings)
 
         defaults = self._reconstruction_defaults(video_path)
+        if defaults["pause_warn"]:
+            log.warning(
+                "%s was paused %d time(s) during capture; the composite will "
+                "jump at each pause",
+                Path(video_path).name,
+                defaults["pauses"],
+            )
         if defaults["kind_warn"]:
             log.warning(
                 "%s is a process recording (taper in progress), not a scan; "
