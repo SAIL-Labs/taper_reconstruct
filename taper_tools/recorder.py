@@ -19,15 +19,16 @@ Features:
     reconstruction, so a failed run can be diagnosed afterwards
   - Remembers last region and settings between sessions
 
-Dependencies:
-    pip install PyQt6 opencv-python-headless numpy mss tqdm
-
 Usage:
-    python taper_recorder.py
+    taper-recorder [--no-update-check]
+
+The installed Windows app checks GitHub releases for an update a few seconds
+after start-up (see updates.py and update_ui.py).
 
 Author: Claude (for Chris @ SAIL)
 """
 
+import argparse
 import sys
 import os
 import json
@@ -89,6 +90,9 @@ from PyQt6.QtWidgets import (
 )
 
 from taper_tools import sidecar
+from taper_tools._version import __version__
+from taper_tools.update_ui import UpdateController
+from taper_tools.updates import Updater, run_install_hooks
 from taper_tools.logging_utils import (
     app_log_path,
     file_log,
@@ -1815,6 +1819,9 @@ class TaperRecorderApp(QObject):
             overlay.pause_clicked.connect(self.toggle_pause)
             overlay.stop_clicked.connect(self._stop_recording)
 
+        self.updates = UpdateController(
+            Updater(), self._notify, self._before_update_restart, parent=self
+        )
         self._setup_tray()
         self._update_status_timer = QTimer(self)
         self._update_status_timer.timeout.connect(self._update_recording_status)
@@ -1943,6 +1950,14 @@ class TaperRecorderApp(QObject):
 
         menu.addSeparator()
 
+        menu.addAction(self.updates.restart_action)
+        menu.addAction(self.updates.check_action)
+        about_action = QAction("About Taper Recorder...", self)
+        about_action.triggered.connect(self._show_about)
+        menu.addAction(about_action)
+
+        menu.addSeparator()
+
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(self._quit)
         menu.addAction(quit_action)
@@ -1961,6 +1976,42 @@ class TaperRecorderApp(QObject):
 
     def _show_tray_message(self, title, msg, icon, timeout):
         self.tray.showMessage(title, msg, icon, timeout)
+
+    def _notify(self, title, msg):
+        self.tray.showMessage(title, msg, QSystemTrayIcon.MessageIcon.Information, 8000)
+
+    # --- Updates ---
+    def _before_update_restart(self):
+        """Clean up before Velopack restarts into an update; False cancels it."""
+        if self.recording or self._busy_videos:
+            what = "a recording" if self.recording else "a reconstruction"
+            QMessageBox.information(
+                None,
+                "Update",
+                f"Wait until {what} has finished, then restart to install the update. "
+                "It is also installed the next time the app starts.",
+            )
+            return False
+        log.info("Restarting to install an update")
+        self._preview_timer.stop()
+        self._close_grabber()
+        self._hide_overlays()
+        save_settings(self.settings)
+        return True
+
+    def _show_about(self):
+        lines = [f"Taper Recorder {__version__}"]
+        if self.updates.updater.available():
+            lines.append("Installed copy: updates itself from GitHub releases.")
+        else:
+            lines.append("Not an installed copy: it does not update itself.")
+        if self.updates.pending is not None:
+            lines.append(
+                f"Version {self.updates.pending.version} is downloaded and is "
+                "installed the next time the app starts."
+            )
+        lines.append(f"Settings: {SETTINGS_PATH}")
+        QMessageBox.about(None, "About Taper Recorder", "\n\n".join(lines))
 
     @staticmethod
     def _region_for_mss(region_list):
@@ -2850,13 +2901,25 @@ def _install_excepthook():
     sys.excepthook = hook
 
 
-def main():
+UPDATE_CHECK_DELAY_MS = 3000
+
+
+def main(argv=None):
+    run_install_hooks()  # first: Velopack install/update/uninstall hooks may exit here
+    ap = argparse.ArgumentParser(prog="taper-recorder")
+    ap.add_argument(
+        "--no-update-check",
+        action="store_true",
+        help="don't look for updates at start-up",
+    )
+    ns, qt_args = ap.parse_known_args(sys.argv[1:] if argv is None else argv)
+
     log_path = setup_app_logging(console=True)
     _install_excepthook()
-    log.info("=== taper recorder starting ===")
+    log.info("=== taper recorder %s starting ===", __version__)
     log_environment(log, {"log file": log_path})
 
-    app = QApplication(sys.argv)
+    app = QApplication([sys.argv[0], *qt_args])
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("Taper Scan Recorder")
 
@@ -2883,6 +2946,9 @@ def main():
             save_settings(settings)
 
     recorder_app = TaperRecorderApp()
+    headless = os.environ.get("QT_QPA_PLATFORM", "") in ("offscreen", "minimal")
+    if not ns.no_update_check and not headless:
+        QTimer.singleShot(UPDATE_CHECK_DELAY_MS, recorder_app.updates.check)
     sys.exit(app.exec())
 
 

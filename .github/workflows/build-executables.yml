@@ -1,102 +1,79 @@
-name: Build Standalone Executables
+# Windows build. Pushing a tag vX.Y.Z runs the tests, builds the recorder, packs it with
+# Velopack and publishes a GitHub release holding:
+#   TaperRecorder-win-Setup.exe        the installer (per user, Start menu, auto-updates)
+#   TaperRecorder-X.Y.Z-full.nupkg,
+#   releases.win.json, assets.win.json, RELEASES
+#                                      what installed copies update from (keep them)
+#   TaperRecorder-win-Portable.zip     the same app without installing (unzip and run;
+#                                      it updates itself too)
+# Running it by hand (Actions > Windows build > Run workflow) builds the same files as a
+# workflow artifact only, without a release.
+#
+# The repository is public, so installed copies read releases without a token.
+name: Windows build
 
 on:
   push:
-    tags:
-      - 'v*'  # Trigger on version tags like v1.0.0
-  workflow_dispatch:  # Allow manual trigger
-    inputs:
-      version:
-        description: 'Version number (e.g., 1.0.0)'
-        required: false
-        default: 'dev'
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  VPK_VERSION: "1.2.161"   # keep equal to the velopack version pinned in pyproject.toml
 
 jobs:
-  build-windows:
+  build:
     runs-on: windows-latest
     defaults:
       run:
-        shell: pwsh
+        shell: bash
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-          cache: 'pip'
+          python-version: "3.12"
+          cache: pip
 
-      - name: Install dependencies
+      - name: Install
+        run: python -m pip install -e ".[dev]"
+
+      - name: Version
         run: |
-          pip install pyinstaller PyQt6 opencv-python-headless numpy mss tqdm scipy
+          version=$(python -c "from taper_tools._version import __version__; print(__version__)")
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match the app version ${version} (taper_tools/_version.py)"
+            exit 1
+          fi
 
-      - name: Set version for build
+      - name: Test
         env:
-          REF_NAME: ${{ github.ref_name }}
-          INPUT_VERSION: ${{ github.event.inputs.version }}
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Build app
+        run: pyinstaller --noconfirm packaging/taper_recorder.spec
+
+      - name: Pack installer (Velopack)
         run: |
-          if ($env:REF_NAME -match '^v') {
-            $version = $env:REF_NAME.TrimStart('v')
-          } elseif (Test-Path VERSION) {
-            $version = (Get-Content VERSION -Raw).Trim()
-          } else {
-            $version = $env:INPUT_VERSION
-            if (-not $version) { $version = "dev" }
-          }
-          Set-Content -Path taper_tools/_version.py -Value "__version__ = `"$version`""
-          Write-Host "Building version: $version"
-          echo "VERSION=$version" >> $env:GITHUB_ENV
+          dotnet tool install -g vpk --version "${VPK_VERSION}"
+          vpk pack --packId TaperRecorder --packVersion "${VERSION}" --packDir dist/TaperRecorder \
+            --mainExe TaperRecorder.exe --packTitle "Taper Recorder" --packAuthors "SAIL Labs" \
+            --outputDir Releases
+          ls -l Releases
 
-      - name: Build Windows executable
-        run: |
-          pyinstaller --onefile --windowed `
-            --name="TaperRecorder-v$env:VERSION" `
-            --paths=. `
-            --hidden-import=taper_tools.reconstruct `
-            --hidden-import=taper_tools.sidecar `
-            --hidden-import=taper_tools.logging_utils `
-            --hidden-import=scipy.stats `
-            --hidden-import=scipy.stats._kde `
-            taper_tools/recorder.py
-
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: TaperRecorder-Windows
-          path: dist/TaperRecorder-*.exe
+          name: TaperRecorder-${{ env.VERSION }}-windows
+          path: Releases/
 
-  create-release:
-    needs: [build-windows]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download Windows artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: TaperRecorder-Windows
-          path: windows-release/
-
-      - name: Create release archive
-        run: |
-          cd windows-release && zip -r ../TaperRecorder-Windows.zip . && cd ..
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            TaperRecorder-Windows.zip
-          generate_release_notes: true
-          body: |
-            ## Installation
-            1. Download `TaperRecorder-Windows.zip`
-            2. Extract and run the `.exe` file
-
-            ## Changes
-          draft: false
-          prerelease: false
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" Releases/* --title "${GITHUB_REF_NAME}" --generate-notes \
+            || gh release upload "${GITHUB_REF_NAME}" Releases/* --clobber

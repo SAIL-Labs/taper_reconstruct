@@ -3,6 +3,8 @@ dist/
 build/
 *.egg-info/
 *.spec
+!packaging/*.spec
+Releases/
 
 # Python
 __pycache__/

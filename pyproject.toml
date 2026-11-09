@@ -15,7 +15,12 @@ dependencies = [
     "PyQt6",
     "mss",
     "scipy",
+    # keep equal to VPK_VERSION in .github/workflows/build-executables.yml
+    "velopack==1.2.161",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyinstaller"]
 
 [project.scripts]
 taper-reconstruct = "taper_tools.reconstruct:main"
@@ -23,5 +28,11 @@ taper-reconstruct = "taper_tools.reconstruct:main"
 [project.gui-scripts]
 taper-recorder = "taper_tools.recorder:main"
 
+[tool.setuptools]
+packages = ["taper_tools"]
+
 [tool.setuptools.dynamic]
 version = {attr = "taper_tools._version.__version__"}
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

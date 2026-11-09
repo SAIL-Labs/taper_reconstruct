@@ -28,9 +28,22 @@ mamba activate taper_reconstruct
 pip install -e .
 ```
 
-### Standalone executable (Windows)
+### Windows installer (recommended)
 
-Download `TaperRecorder.exe` from the [latest release](../../releases/latest). No Python installation required.
+Download `TaperRecorder-win-Setup.exe` from the [latest release](../../releases/latest) and run it. No Python and no admin rights needed: it installs for the current user under `%LOCALAPPDATA%\TaperRecorder`, adds a Start menu shortcut and an entry in Add/Remove Programs.
+
+The installed app keeps itself up to date from this repository's GitHub releases:
+
+- A few seconds after start-up it quietly checks for a newer release and downloads it in the background.
+- When one is ready, a tray message says so and the tray menu gains **Restart to Install vX.Y.Z**. Ignore it and the update is installed the next time the app starts. Restarting is refused while a recording or reconstruction is running.
+- Tray menu → **Check for Updates...** reports every outcome; **About Taper Recorder...** shows the version.
+- Start it with `--no-update-check` to skip the start-up check.
+
+Settings (`~/.taper_recorder.json`) and logs (`~/.taper_tools/logs`) live outside the install folder, so updates never touch them.
+
+`TaperRecorder-win-Portable.zip` holds the same app without installing; unzip and run `TaperRecorder.exe`. It updates itself too.
+
+**Upgrading from 0.4.0 or earlier** (the single `TaperRecorder-vX.Y.Z.exe` in a zip): those builds can't update themselves. Install `TaperRecorder-win-Setup.exe` once by hand, then delete the old exe. Your settings carry over.
 
 ## Usage
 
@@ -211,28 +224,33 @@ metadata lookup and `--fps` overrides the frame rate used for the pixel scale.
 ### Locally with PyInstaller
 
 ```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed \
-    --name TaperRecorder \
-    --hidden-import=taper_tools.reconstruct \
-    --hidden-import=scipy.stats \
-    taper_tools/recorder.py
+pip install -e ".[dev]"
+pyinstaller packaging/taper_recorder.spec
 ```
 
-The executable will be in `dist/TaperRecorder.exe`.
+This is a one-folder build: `dist/TaperRecorder/` holds `TaperRecorder.exe` and `_internal/`. Updates only work in a copy installed by the Velopack installer, so a local build doesn't update itself.
 
-### Via GitHub Actions
+### Releasing
 
-Push a version tag to trigger an automated build:
+The version lives in one place, `taper_tools/_version.py`. To release:
 
 ```bash
-git tag v0.1.0
-git push --tags
+# bump __version__ in taper_tools/_version.py to 0.5.0, commit, then:
+git tag v0.5.0
+git push origin main v0.5.0
 ```
 
-This runs the workflow in `.github/workflows/build-executables.yml`, which builds the Windows executable and creates a GitHub Release with the `.exe`.
+The workflow in `.github/workflows/build-executables.yml` then, on `windows-latest`:
 
-You can also trigger a build manually from the Actions tab using "workflow_dispatch".
+1. installs the package and fails if the tag isn't `v` + `__version__`;
+2. runs the tests;
+3. builds the one-folder app with PyInstaller;
+4. packs it with Velopack (`vpk pack`) into the installer, the portable zip and the update feed;
+5. publishes all of `Releases/` to the GitHub release: `TaperRecorder-win-Setup.exe`, `TaperRecorder-win-Portable.zip`, `TaperRecorder-X.Y.Z-full.nupkg`, `releases.win.json`, `assets.win.json` and `RELEASES`. Keep them all: installed copies update from these.
+
+Running the workflow by hand (Actions → Windows build → Run workflow) builds the same files as a workflow artifact, without a release.
+
+The `vpk` CLI version (`VPK_VERSION` in the workflow) and the `velopack` Python package version (pinned in `pyproject.toml`) must stay equal.
 
 ## Dependencies
 
@@ -242,6 +260,7 @@ You can also trigger a build manually from the Actions tab using "workflow_dispa
 - **mss** — screen capture
 - **tqdm** — progress bars
 - **scipy** — KDE for shift peak detection (optional, falls back to histogram)
+- **velopack** — installer hooks and self-update for the Windows build
 
 ## License
 
