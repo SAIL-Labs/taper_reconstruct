@@ -39,6 +39,8 @@ The installed app keeps itself up to date from this repository's GitHub releases
 - Tray menu → **Check for Updates...** reports every outcome; **About Taper Recorder...** shows the version.
 - Start it with `--no-update-check` to skip the start-up check.
 
+Only one copy runs per user. Starting it again while it's running just shows a tray message from the running copy, so a double-clicked shortcut can't start a second recorder.
+
 Settings (`~/.taper_recorder.json`) and logs (`~/.taper_tools/logs`) live outside the install folder, so updates never touch them.
 
 `TaperRecorder-win-Portable.zip` holds the same app without installing; unzip and run `TaperRecorder.exe`. It updates itself too.

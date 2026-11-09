@@ -30,6 +30,16 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+# Arguments Velopack starts the exe with during install, update and uninstall.
+HOOK_ARGS = ("--veloapp-install", "--veloapp-updated", "--veloapp-obsolete",
+             "--veloapp-uninstall")
+
+
+def is_install_hook(argv) -> bool:
+    """True when Velopack started this process to run an install/update/uninstall hook."""
+    return any(a in HOOK_ARGS for a in argv)
+
+
 def run_install_hooks() -> None:
     """Velopack's start-up hook. Must run first thing in ``main``: during install,
     update and uninstall Velopack starts the exe with special arguments and this handles

@@ -92,7 +92,8 @@ from PyQt6.QtWidgets import (
 from taper_tools import sidecar
 from taper_tools._version import __version__
 from taper_tools.update_ui import UpdateController
-from taper_tools.updates import Updater, run_install_hooks
+from taper_tools.single_instance import SingleInstance
+from taper_tools.updates import Updater, is_install_hook, run_install_hooks
 from taper_tools.logging_utils import (
     app_log_path,
     file_log,
@@ -1977,6 +1978,16 @@ class TaperRecorderApp(QObject):
     def _show_tray_message(self, title, msg, icon, timeout):
         self.tray.showMessage(title, msg, icon, timeout)
 
+    def show_already_running(self):
+        """Another launch was attempted while this copy runs."""
+        log.info("Second launch attempted; already running")
+        self.tray.showMessage(
+            "Taper Recorder Is Already Running",
+            "Right-click the blue \u201cT\u201d tray icon to use it.",
+            QSystemTrayIcon.MessageIcon.Information,
+            5000,
+        )
+
     def _notify(self, title, msg):
         self.tray.showMessage(title, msg, QSystemTrayIcon.MessageIcon.Information, 8000)
 
@@ -2904,15 +2915,39 @@ def _install_excepthook():
 UPDATE_CHECK_DELAY_MS = 3000
 
 
+def _already_running(instance):
+    """Another copy holds the lock: point the user at it, then exit."""
+    if instance.notify_running():
+        return 0  # the running copy shows a tray message
+    # The lock is held but nobody answered (the other copy is hung or still starting).
+    app = QApplication.instance() or QApplication(sys.argv[:1])
+    QMessageBox.information(
+        None,
+        "Taper Recorder",
+        "Taper Recorder is already running. Look for the blue \u201cT\u201d icon in "
+        "the system tray (it may be under the \u2227 arrow).\n\n"
+        f"If it isn't running, delete {instance.lock_path} and start it again.",
+    )
+    return 0
+
+
 def main(argv=None):
-    run_install_hooks()  # first: Velopack install/update/uninstall hooks may exit here
+    argv = sys.argv[1:] if argv is None else argv
+    if is_install_hook(argv):
+        run_install_hooks()  # Velopack install/update/uninstall hook: exits here
+    # One copy per user. Checked before the start-up hook below, which installs a
+    # downloaded update and must not do so while another copy runs from the folder.
+    instance = SingleInstance()
+    if not instance.acquire():
+        sys.exit(_already_running(instance))
+    run_install_hooks()  # may install a pending update and restart into it
     ap = argparse.ArgumentParser(prog="taper-recorder")
     ap.add_argument(
         "--no-update-check",
         action="store_true",
         help="don't look for updates at start-up",
     )
-    ns, qt_args = ap.parse_known_args(sys.argv[1:] if argv is None else argv)
+    ns, qt_args = ap.parse_known_args(argv)
 
     log_path = setup_app_logging(console=True)
     _install_excepthook()
@@ -2946,6 +2981,7 @@ def main(argv=None):
             save_settings(settings)
 
     recorder_app = TaperRecorderApp()
+    instance.listen(recorder_app.show_already_running)
     headless = os.environ.get("QT_QPA_PLATFORM", "") in ("offscreen", "minimal")
     if not ns.no_update_check and not headless:
         QTimer.singleShot(UPDATE_CHECK_DELAY_MS, recorder_app.updates.check)
