@@ -1,3 +1,5 @@
+import subprocess
+import sys
 import time
 import uuid
 
@@ -5,6 +7,17 @@ import pytest
 
 from taper_tools.single_instance import SingleInstance
 from taper_tools.updates import is_install_hook
+
+
+SECOND_LAUNCH = """
+import sys
+from taper_tools.single_instance import SingleInstance
+
+second = SingleInstance(sys.argv[1], sys.argv[2])
+if second.acquire():
+    sys.exit(2)
+sys.exit(0 if second.notify_running(timeout_ms=10000) else 1)
+"""
 
 
 @pytest.fixture
@@ -36,10 +49,16 @@ def test_second_launch_tells_the_running_copy(qapp, tmp_path, key):
     seen = []
     first.listen(lambda: seen.append(True))
 
-    second = SingleInstance(key, tmp_path)
-    assert not second.acquire()
-    assert second.notify_running()
-    assert wait_for(qapp, lambda: seen == [True])
+    # A separate process, as for a real second launch. It can't share this thread: on
+    # Windows the pipe has no buffer, so the write only completes once the server reads.
+    second = subprocess.Popen([sys.executable, "-c", SECOND_LAUNCH, key, str(tmp_path)])
+    try:
+        assert wait_for(qapp, lambda: second.poll() is not None and seen, timeout=60)
+    finally:
+        if second.poll() is None:
+            second.kill()
+    assert second.returncode == 0
+    assert seen == [True]
     first.release()
 
 
